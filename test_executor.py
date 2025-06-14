@@ -9,6 +9,6 @@ def test_executor_init():
 @pytest.mark.asyncio
 async def test_executor_run_shell():
     e = Executor()
-    result = await e.run_shell("echo hi")
-    assert result.output.strip() == "hi"
-    assert result.status == "success"
+    output, error = await e.run_shell("echo hi")
+    assert output.strip() == "hi"
+    assert error is None

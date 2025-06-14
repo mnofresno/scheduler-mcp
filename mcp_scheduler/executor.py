@@ -393,3 +393,7 @@ class Executor:
         except Exception as e:
             logger.exception("Error in reminder task")
             return None, f"Reminder task failed: {str(e)}"
+
+    def run_shell(self, command: str):
+        """Public wrapper for _execute_shell_command for testing purposes."""
+        return self._execute_shell_command(command)
