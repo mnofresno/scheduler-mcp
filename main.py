@@ -10,6 +10,7 @@ import sys
 import traceback
 import threading
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from mcp_scheduler.config import Config
 from mcp_scheduler.persistence import Database
@@ -31,81 +32,63 @@ except ImportError:
 # Global variables for cleanup
 scheduler = None
 server = None
-scheduler_task = None
+scheduler_thread = None
+scheduler_loop = None
+shutdown_event = threading.Event()
 
 def log_to_stderr(message):
     """Log messages to stderr instead of stdout to avoid interfering with stdio transport."""
     print(message, file=sys.stderr, flush=True)
 
-def run_scheduler_in_thread(scheduler_instance):
-    """Run the scheduler in a separate thread."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    async def scheduler_loop():
-        await scheduler_instance.start()
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            await scheduler_instance.stop()
-    
-    loop.run_until_complete(scheduler_loop())
-    loop.close()
-
 def handle_sigterm(signum, frame):
-    """Handle SIGTERM gracefully"""
-    log_to_stderr("Received SIGTERM signal. Shutting down...")
+    """Handle SIGTERM signal."""
+    log_to_stderr("Received SIGTERM, shutting down...")
+    shutdown_event.set()
     if scheduler:
-        try:
-            # Create a new event loop for clean shutdown
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(scheduler.stop())
-            loop.close()
-        except Exception as e:
-            log_to_stderr(f"Error during shutdown: {e}")
+        scheduler.stop()
+    if server:
+        server.stop()
+    if scheduler_thread and scheduler_thread.is_alive():
+        scheduler_thread.join(timeout=5)
+    if scheduler_loop and scheduler_loop.is_running():
+        scheduler_loop.stop()
     sys.exit(0)
 
-# Custom input wrapper to handle malformed JSON
-class SafeJsonStdin:
-    def __init__(self, original_stdin):
-        self.original_stdin = original_stdin
-        
-    def readline(self):
-        line = self.original_stdin.readline()
-        if not line:
-            return line
-            
-        # Only try to fix lines that look like JSON
-        if line.strip().startswith('{') or line.strip().startswith('['):
-            try:
-                # Parse the JSON to ensure it's valid
-                json_obj = json.loads(line)
-                return line
-            except json.JSONDecodeError as e:
-                log_to_stderr(f"Fixing malformed JSON input: {e}")
-                # Try to extract the ID if present
-                try:
-                    import re
-                    id_match = re.search(r'"id"\s*:\s*(\d+)', line)
-                    if id_match:
-                        id_val = id_match.group(1)
-                        return f'{{"jsonrpc":"2.0","id":{id_val},"error":{{"code":-32700,"message":"Parse error"}}}}\n'
-                    # Default response for malformed JSON
-                    return '{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}\n'
-                except Exception as ex:
-                    log_to_stderr(f"Error creating error response: {ex}")
-                    # Ultimate fallback
-                    return '{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}\n'
-                    
-        return line
-        
-    def __getattr__(self, name):
-        return getattr(self.original_stdin, name)
+async def run_scheduler():
+    """Run the scheduler in the background."""
+    try:
+        await scheduler.start()
+        while not shutdown_event.is_set():
+            await asyncio.sleep(1)
+    except Exception as e:
+        log_to_stderr(f"Error in scheduler: {str(e)}")
+        if debug_mode:
+            traceback.print_exc()
+        raise
+    finally:
+        await scheduler.stop()
+
+def run_loop():
+    """Run the scheduler loop in a background thread."""
+    global scheduler_loop
+    try:
+        scheduler_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(scheduler_loop)
+        scheduler_loop.run_until_complete(run_scheduler())
+    except Exception as e:
+        log_to_stderr(f"Error in scheduler loop: {str(e)}")
+        if debug_mode:
+            traceback.print_exc()
+    finally:
+        if scheduler_loop and scheduler_loop.is_running():
+            scheduler_loop.stop()
+        if scheduler_loop and not scheduler_loop.is_closed():
+            scheduler_loop.close()
 
 def main():
     """Main entry point."""
+    global scheduler, server, scheduler_thread, scheduler_loop
+    
     parser = argparse.ArgumentParser(description="MCP Scheduler Server")
     parser.add_argument(
         "--address", 
@@ -226,41 +209,25 @@ def main():
         
         # Initialize components
         database = Database(config.db_path)
-        executor = Executor(config.openai_api_key, config.ai_model)
-        executor.execution_timeout = config.execution_timeout
-        
-        global scheduler
+        executor = Executor(None, config.ai_model)
         scheduler = Scheduler(database, executor)
-        
-        global server
         server = SchedulerServer(scheduler, config)
         
-        # Start the scheduler in a separate thread
-        scheduler_thread = threading.Thread(
-            target=run_scheduler_in_thread,
-            args=(scheduler,),
-            daemon=True
-        )
+        # Start scheduler in background thread
+        scheduler_thread = threading.Thread(target=run_loop, daemon=True)
         scheduler_thread.start()
-        log_to_stderr(f"Scheduler started in background thread")
-
-        try:
-            log_to_stderr(
-                f"Starting server on {config.server_address}:{config.server_port} using {config.transport} transport"
-            )
-            server.start()
-        except KeyboardInterrupt:
-            log_to_stderr("Interrupted by user")
-            sys.exit(0)
+        log_to_stderr("Scheduler started in background thread")
         
+        # Start server
+        log_to_stderr(f"Starting server on {config.server_address}:{config.server_port} using {config.transport} transport")
+        server.start()
+
     except KeyboardInterrupt:
         log_to_stderr("Interrupted by user")
+        shutdown_event.set()
+        if scheduler_thread and scheduler_thread.is_alive():
+            scheduler_thread.join(timeout=5)
         sys.exit(0)
-    except json.JSONDecodeError as e:
-        log_to_stderr(f"JSON parsing error: {e}")
-        if debug_mode:
-            traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
     except Exception as e:
         log_to_stderr(f"Error during initialization: {e}")
         if debug_mode:

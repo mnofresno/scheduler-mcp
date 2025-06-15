@@ -15,17 +15,17 @@ class Config:
         # Server configuration
         self.server_name = os.environ.get("MCP_SCHEDULER_NAME", "mcp-scheduler")
         self.server_version = os.environ.get("MCP_SCHEDULER_VERSION", "0.1.0")
-        self.server_address = os.environ.get("MCP_SCHEDULER_ADDRESS", "localhost")
+        self.server_address = os.environ.get("MCP_SCHEDULER_ADDRESS", "0.0.0.0")  # Changed to 0.0.0.0 to allow external connections
         self.server_port = int(os.environ.get("MCP_SCHEDULER_PORT", "8080"))
-        self.transport = os.environ.get("MCP_SCHEDULER_TRANSPORT", "stdio")  # Default to stdio
-        self.strict_json = os.environ.get("MCP_SCHEDULER_STRICT_JSON", "false").lower() == "true"
+        self.transport = os.environ.get("MCP_SCHEDULER_TRANSPORT", "sse")  # Changed default to sse
+        self.strict_json = os.environ.get("MCP_SCHEDULER_STRICT_JSON", "true").lower() == "true"  # Changed default to true
         
         # Database configuration
         self.db_path = os.environ.get("MCP_SCHEDULER_DB_PATH", "scheduler.db")
         
         # Logging configuration
         self.log_level = os.environ.get("MCP_SCHEDULER_LOG_LEVEL", "INFO")
-        self.log_file = os.environ.get("MCP_SCHEDULER_LOG_FILE", "mcp_scheduler.log")  # Default to a log file
+        self.log_file = os.environ.get("MCP_SCHEDULER_LOG_FILE", None)  # Changed to None to log to stdout by default
         
         # Scheduler configuration
         self.check_interval = int(os.environ.get("MCP_SCHEDULER_CHECK_INTERVAL", "5"))
@@ -33,7 +33,7 @@ class Config:
         
         # AI configuration
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", None)
-        self.ai_model = os.environ.get("MCP_SCHEDULER_AI_MODEL", "gpt-4o")
+        self.ai_model = os.environ.get("MCP_SCHEDULER_AI_MODEL", "gpt-4")  # Fixed model name
         
         # Load config from file if provided
         config_file = os.environ.get("MCP_SCHEDULER_CONFIG_FILE", None)

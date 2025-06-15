@@ -10,21 +10,43 @@ import os
 import asyncio
 import uvicorn
 import uvicorn.config
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Literal
 import threading
 import time
 from fastapi import Request, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import inspect
-
-from mcp.server.fastmcp import FastMCP, Context
+from datetime import datetime
+from fastmcp import FastMCP
+from fastmcp.server.http import StarletteWithLifespan, create_sse_app, SseServerTransport
+from fastmcp.utilities.logging import get_logger
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import Receive, Scope, Send
+from contextlib import asynccontextmanager
+from starlette.middleware import Middleware
 
 from .task import Task, TaskStatus, TaskType
 from .scheduler import Scheduler
 from .config import Config
 from .utils import human_readable_cron
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+def log_request(request: Request, message: str, level: str = "info"):
+    """Log request details with timestamp and client info."""
+    client_host = request.client.host if request.client else "unknown"
+    timestamp = datetime.utcnow().isoformat()
+    log_message = f"[{timestamp}] {message} - Client: {client_host} - Path: {request.url.path}"
+    
+    if level == "info":
+        logger.info(log_message)
+    elif level == "error":
+        logger.error(log_message)
+    elif level == "warning":
+        logger.warning(log_message)
+    elif level == "debug":
+        logger.debug(log_message)
 
 def tool_to_schema(tool):
     """Serialize a tool (function) to a schema dict for the well-known endpoint."""
@@ -75,33 +97,129 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         return super().encode(obj)
 
 class CustomFastMCP(FastMCP):
-    """Custom FastMCP implementation that exposes a .app property for FastAPI mounting."""
-    def __init__(self, *args, transport="sse", **kwargs):
+    """Custom FastMCP server with enhanced logging."""
+    
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._transport = transport
-        # Initialize app based on transport type immediately
+        self._sse_transport = None
+        self._tools = {}  # Initialize tools dictionary
+        
+    def http_app(
+        self,
+        path: str | None = None,
+        middleware: list[Middleware] | None = None,
+        transport: Literal["streamable-http", "sse"] = "streamable-http",
+    ) -> StarletteWithLifespan:
+        """Create a Starlette app using the specified HTTP transport with enhanced logging."""
+        
         if transport == "sse":
-            self.app = self.sse_app()
-        elif transport == "streamable-http":
-            self.app = self.streamable_http_app()
+            # Initialize SSE transport with logging and custom path
+            base_path = path or "/api/mcp"
+            self._sse_transport = SseServerTransport(f"{base_path}/messages")
+            
+            # Create a custom SSE handler with enhanced logging
+            async def handle_sse(scope: Scope, receive: Receive, send: Send) -> Response:
+                client_info = {
+                    "host": scope.get("client", ("unknown", 0))[0],
+                    "headers": dict(scope.get("headers", [])),
+                    "query_params": dict(scope.get("query_string", b"").decode().split("&") if scope.get("query_string") else []),
+                    "path": scope.get("path", "unknown"),
+                }
+                logger.info(f"New SSE connection established from {client_info}")
+                start_time = time.time()
+                
+                try:
+                    async with self._sse_transport.connect_sse(scope, receive, send) as streams:
+                        await self._mcp_server.run(
+                            streams[0],
+                            streams[1],
+                            self._mcp_server.create_initialization_options(),
+                        )
+                    duration = time.time() - start_time
+                    logger.info(f"SSE connection closed after {duration:.2f}s from {client_info}")
+                    return Response()
+                except Exception as e:
+                    duration = time.time() - start_time
+                    logger.error(f"SSE connection error after {duration:.2f}s from {client_info}: {str(e)}", exc_info=True)
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "Internal Server Error",
+                            "message": str(e) if logger.isEnabledFor(logging.DEBUG) else "Connection error"
+                        }
+                    )
+                    
+            # Create a custom message handler with enhanced logging
+            async def handle_post_message(scope: Scope, receive: Receive, send: Send) -> None:
+                request = Request(scope, receive)
+                client_info = {
+                    "host": scope.get("client", ("unknown", 0))[0],
+                    "headers": dict(scope.get("headers", [])),
+                    "query_params": dict(scope.get("query_string", b"").decode().split("&") if scope.get("query_string") else []),
+                    "path": scope.get("path", "unknown"),
+                }
+                logger.info(f"Received POST message from {client_info}")
+                
+                try:
+                    await self._sse_transport.handle_post_message(scope, receive, send)
+                    logger.info(f"Successfully processed POST message from {client_info}")
+                except Exception as e:
+                    logger.error(f"Error processing POST message from {client_info}: {str(e)}", exc_info=True)
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "Internal Server Error",
+                            "message": str(e) if logger.isEnabledFor(logging.DEBUG) else "Message processing error"
+                        }
+                    )
+                    
+            # Create the app with our custom handlers and enhanced middleware
+            app = create_sse_app(
+                server=self,
+                message_path=f"{base_path}/messages",
+                sse_path=f"{base_path}/sse",
+                auth=self.auth,
+                debug=False,  # Disable debug mode for production
+                middleware=middleware or [],
+            )
+            
+            # Replace the default handlers with our custom ones
+            for route in app.routes:
+                if route.path == f"{base_path}/sse":
+                    route.endpoint = handle_sse
+                elif route.path == f"{base_path}/messages":
+                    route.app = handle_post_message
+                    
+            return app
+            
         else:
-            self.app = None
-        # Initialize tools list
-        self.tools = []
+            # Use the default implementation for other transports
+            return super().http_app(
+                path=path,
+                middleware=middleware,
+                transport=transport,
+            )
 
     def tool(self, *args, **kwargs):
-        """Override tool decorator to track registered tools."""
+        """Custom tool decorator that ensures tools are properly registered."""
         def decorator(func):
-            # Get the original tool decorator from the parent class
-            original_tool = FastMCP.tool(self, *args, **kwargs)
-            # Apply the original decorator
-            tool = original_tool(func)
-            # Add to our tools list
-            if not hasattr(self, 'tools'):
-                self.tools = []
-            self.tools.append(tool)
-            return tool
+            tool_name = func.__name__
+            # Register the tool in our local dictionary
+            self._tools[tool_name] = func
+            # Use the parent class's tool decorator
+            decorated_func = FastMCP.tool(self, *args, **kwargs)(func)
+            return decorated_func
         return decorator
+
+    @property
+    def tools(self):
+        """Get the list of registered tools."""
+        # First try to get tools from parent class
+        parent_tools = super().tools if hasattr(super(), 'tools') else []
+        # Then combine with our local tools
+        local_tools = list(self._tools.values())
+        # Return unique tools (avoid duplicates)
+        return list({tool.__name__: tool for tool in parent_tools + local_tools}.values())
 
 class SchedulerServer:
     """MCP server for task scheduling."""
@@ -115,57 +233,95 @@ class SchedulerServer:
         uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn"]["level"] = "WARNING"
         uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(message)s"
         
-        # Create main FastAPI application
+        # Create main FastAPI application with enhanced metadata
         self.app = FastAPI(
             title=self.config.server_name,
             version=self.config.server_version,
-            description="MCP Scheduler with well-known endpoint"
+            description="MCP Scheduler with well-known endpoint and SSE transport",
+            docs_url="/api/docs",  # Move Swagger UI to /api/docs
+            redoc_url="/api/redoc",  # Move ReDoc to /api/redoc
+            openapi_url="/api/openapi.json",  # Move OpenAPI schema to /api/openapi.json
         )
+        
+        # Add middleware for request logging and CORS
+        @self.app.middleware("http")
+        async def log_requests(request: Request, call_next):
+            if request.url.path == "/.well-known/mcp-schema.json":
+                log_request(request, "Well-known schema request received", "info")
+            response = await call_next(request)
+            if request.url.path == "/.well-known/mcp-schema.json":
+                log_request(request, f"Well-known schema request completed with status {response.status_code}", "info")
+            return response
         
         # Create MCP server with custom response formatting
         self.mcp = CustomFastMCP(
             host=config.server_address,
-            port=config.server_port,
-            transport=config.transport
+            port=config.server_port
         )
         
         # Register tools first
         self._register_tools()
+        logger.info(f"Tools registrados: {self.mcp.tools}")
         
-        # Mount MCP server at /mcp only if the FastAPI app is available
-        if self.mcp.app:
-            self.app.mount("/mcp", self.mcp.app)
-        elif self.config.transport in ("sse", "streamable-http"):
-            logger.error("MCP app not initialized - transport may not be supported")
-            raise RuntimeError("MCP transport not supported")
-        # For stdio transport, nothing is mounted and no exception is raised
+        # Montar la app HTTP/SSE de FastMCP
+        if self.config.transport in ("sse", "streamable-http"):
+            try:
+                mcp_app = self.mcp.http_app(
+                    path="/mcp",
+                    transport=self.config.transport,
+                    middleware=[]  # Add any additional middleware here if needed
+                )
+                self.app.mount("/mcp", mcp_app)
+                logger.info(f"MCP server mounted at /mcp with {config.transport} transport")
+            except Exception as e:
+                logger.error(f"Error mounting MCP app: {str(e)}", exc_info=True)
+                raise RuntimeError(f"Failed to mount MCP app: {str(e)}")
+        elif self.config.transport == "stdio":
+            logger.info("MCP server running in stdio mode")
+        else:
+            logger.error(f"MCP app not initialized - transport '{config.transport}' not supported")
+            raise RuntimeError(f"MCP transport '{config.transport}' not supported")
         
-        # Add well-known endpoint at root level
+        # Add well-known endpoint at root level con log de tools
         @self.app.get("/.well-known/mcp-schema.json")
         async def well_known_handler(request: Request) -> JSONResponse:
             """Handle requests to the well-known endpoint."""
             try:
-                if not hasattr(self.mcp, 'tools'):
-                    logger.error("MCP tools not available")
+                logger.info(f"Tools disponibles en well-known: {self.mcp.tools}")
+                if not self.mcp.tools:
+                    log_request(request, "Well-known schema request failed - MCP tools not available", "error")
                     return JSONResponse(
-                        {"error": "MCP tools not available"},
-                        status_code=503
+                        status_code=503,
+                        content={
+                            "error": "Service Unavailable",
+                            "message": "MCP tools not available"
+                        }
                     )
                 # Convert tools to schema
                 mcp_tools = [tool_to_schema(tool) for tool in self.mcp.tools]
-                # Build response
+                # Build enhanced response
                 response = {
                     "name": self.config.server_name,
                     "version": self.config.server_version,
                     "tools": mcp_tools,
-                    "mcp_endpoint": f"/mcp"  # Add MCP endpoint location
+                    "mcp_endpoint": "/mcp",  # Endpoint original
+                    "transport": self.config.transport,
+                    "server_info": {
+                        "address": self.config.server_address,
+                        "port": self.config.server_port,
+                        "status": "running" if self.scheduler.active else "stopped"
+                    }
                 }
+                log_request(request, "Well-known schema request successful", "info")
                 return JSONResponse(response)
             except Exception as e:
-                logger.error(f"Error in well-known handler: {e}")
+                log_request(request, f"Well-known schema request failed with error: {str(e)}", "error")
                 return JSONResponse(
-                    {"error": "Internal server error"},
-                    status_code=500
+                    status_code=500,
+                    content={
+                        "error": "Internal Server Error",
+                        "message": str(e) if logger.isEnabledFor(logging.DEBUG) else "Schema generation error"
+                    }
                 )
         
         # nothing else to init
@@ -174,6 +330,7 @@ class SchedulerServer:
         """Register MCP tools."""
         import logging
         logger = logging.getLogger(__name__)
+        logger.info("Ejecutando _register_tools() para MCP tools")
 
         @self.mcp.tool()
         async def list_tasks() -> List[Dict[str, Any]]:
@@ -456,6 +613,13 @@ class SchedulerServer:
                 "execution_timeout": self.config.execution_timeout,
                 "ai_model": self.config.ai_model
             }
+
+        logger.info(f"Tools después de registrar: {self.mcp.tools}")
+        # Forzar inicialización manual si no existe
+        if not self.mcp.tools:
+            if hasattr(self.mcp, '_tools'):
+                self.mcp.tools = list(self.mcp._tools.values())
+                logger.info(f"Tools forzados manualmente: {self.mcp.tools}")
 
     def _format_task_response(self, task: Task) -> Dict[str, Any]:
         """Format a task for API response."""
