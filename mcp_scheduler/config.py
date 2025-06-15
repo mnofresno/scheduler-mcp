@@ -17,7 +17,6 @@ class Config:
         self.server_version = os.environ.get("MCP_SCHEDULER_VERSION", "0.1.0")
         self.server_address = os.environ.get("MCP_SCHEDULER_ADDRESS", "localhost")
         self.server_port = int(os.environ.get("MCP_SCHEDULER_PORT", "8080"))
-        self.well_known_port = int(os.environ.get("MCP_WELL_KNOWN_PORT", "8081"))
         self.transport = os.environ.get("MCP_SCHEDULER_TRANSPORT", "stdio")  # Default to stdio
         self.strict_json = os.environ.get("MCP_SCHEDULER_STRICT_JSON", "false").lower() == "true"
         
@@ -58,7 +57,6 @@ class Config:
             self.server_port = config.get("server", {}).get("port", self.server_port)
             self.transport = config.get("server", {}).get("transport", self.transport)
             self.strict_json = config.get("server", {}).get("strict_json", self.strict_json)
-            self.well_known_port = config.get("server", {}).get("well_known_port", self.well_known_port)
             
             # Database configuration
             self.db_path = config.get("database", {}).get("path", self.db_path)
@@ -87,8 +85,7 @@ class Config:
                 "address": self.server_address,
                 "port": self.server_port,
                 "transport": self.transport,
-                "strict_json": self.strict_json,
-                "well_known_port": self.well_known_port
+                "strict_json": self.strict_json
             },
             "database": {
                 "path": self.db_path
