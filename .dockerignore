@@ -48,8 +48,7 @@ tests/
 docker/
 
 # Documentation
-README.md
-LICENSE
+# (keep README and LICENSE in the build context)
 
 # Environment files
 .env

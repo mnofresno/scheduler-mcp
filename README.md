@@ -96,6 +96,14 @@ python main.py --transport sse --port 8080
 python main.py --debug
 ```
 
+### What is SSE Transport?
+
+SSE (Server-Sent Events) is an HTTP-based protocol that allows the server to push
+events to the client over a single long-lived connection. When running the
+scheduler with `--transport sse`, FastMCP exposes an HTTP endpoint that streams
+JSON-RPC responses using SSE. This mode is suitable when integrating with tools
+that expect an HTTP interface rather than standard input/output.
+
 ### Integrating with Claude Desktop or other MCP Clients
 
 To use your MCP Scheduler with Claude Desktop:
@@ -223,19 +231,13 @@ The scheduler can be configured using environment variables:
 - `MCP_SCHEDULER_AI_MODEL`: OpenAI model for AI tasks (default: gpt-4o)
 - `OPENAI_API_KEY`: API key for OpenAI tasks
 
-## Server Ports
+## Server Port
 
-The MCP Scheduler now supports two independent server ports:
+The MCP Scheduler exposes its API and the auto-discovery endpoint on a single port.
 
-- **MCP Server Port:**  
-  The MCP server (FastMCP) listens on the port defined by the environment variable `MCP_SCHEDULER_PORT` (default: 8080).  
-  (This port is used for the MCP (Model Context Protocol) endpoint.)
-
-- **Well-Known Server Port:**  
-  The "well-known" server (exposing the auto-discovery endpoint) listens on the port defined by the environment variable `MCP_WELL_KNOWN_PORT` (default: 8081).  
-  (This endpoint is available at `http://<address>:<MCP_WELL_KNOWN_PORT>/.well-known/mcp-schema.json`.)
-
-You can customize these ports independently (for example, via environment variables or a JSON config file) so that both servers run on your desired ports.
+* **MCP Server Port:**
+  The server listens on the port defined by the environment variable `MCP_SCHEDULER_PORT` (default: `8080`).
+  The well-known schema is available at `http://<address>:<MCP_SCHEDULER_PORT>/.well-known/mcp-schema.json`.
 
 ## Examples
 
@@ -292,7 +294,7 @@ await scheduler.add_reminder_task(
 
 When running in SSE (HTTP) mode, MCP Scheduler exposes a well-known endpoint for tool/schema auto-discovery:
 
-- **Endpoint:** `/.well-known/mcp-schema.json` (on the HTTP port + 1, e.g., if your server runs on 8080, the schema is on 8081)
+- **Endpoint:** `/.well-known/mcp-schema.json` on the same port as the MCP API.
 - **Purpose:** Allows clients and AI assistants to discover all available MCP tools and their parameters automatically.
 
 ### Example
@@ -306,7 +308,7 @@ python main.py --transport sse --port 8080
 You can access the schema at:
 
 ```
-http://localhost:8081/.well-known/mcp-schema.json
+http://localhost:8080/.well-known/mcp-schema.json
 ```
 
 ### Example Response
