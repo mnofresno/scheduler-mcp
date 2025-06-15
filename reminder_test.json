@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "add_reminder_task",
+  "params": {
+    "name": "Test Reminder",
+    "schedule": "* * * * *",
+    "message": "¡Esto es una alerta de prueba!",
+    "title": "Alerta AI",
+    "description": "Recordatorio de prueba",
+    "enabled": true,
+    "do_only_once": true
+  }
+} 

@@ -7,7 +7,6 @@ ENV PYTHONUNBUFFERED=1 \
     MCP_SCHEDULER_NAME="mcp-scheduler" \
     MCP_SCHEDULER_VERSION="0.1.0" \
     MCP_SCHEDULER_ADDRESS="0.0.0.0" \
-    MCP_SCHEDULER_PORT="8080" \
     MCP_SCHEDULER_TRANSPORT="sse" \
     MCP_SCHEDULER_LOG_LEVEL="INFO" \
     MCP_SCHEDULER_CHECK_INTERVAL="5" \
@@ -25,16 +24,12 @@ WORKDIR /app
 COPY requirements.txt .
 COPY main.py .
 COPY mcp_scheduler/ ./mcp_scheduler/
-
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt && \
     chown -R mcp:mcp /app
 
 # Switch to non-root user
 USER mcp
-
-# Expose the server port
-EXPOSE 8080
 
 # Set entrypoint
 ENTRYPOINT ["python", "main.py"] 

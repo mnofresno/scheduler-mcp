@@ -223,6 +223,20 @@ The scheduler can be configured using environment variables:
 - `MCP_SCHEDULER_AI_MODEL`: OpenAI model for AI tasks (default: gpt-4o)
 - `OPENAI_API_KEY`: API key for OpenAI tasks
 
+## Server Ports
+
+The MCP Scheduler now supports two independent server ports:
+
+- **MCP Server Port:**  
+  The MCP server (FastMCP) listens on the port defined by the environment variable `MCP_SCHEDULER_PORT` (default: 8080).  
+  (This port is used for the MCP (Model Context Protocol) endpoint.)
+
+- **Well-Known Server Port:**  
+  The "well-known" server (exposing the auto-discovery endpoint) listens on the port defined by the environment variable `MCP_WELL_KNOWN_PORT` (default: 8081).  
+  (This endpoint is available at `http://<address>:<MCP_WELL_KNOWN_PORT>/.well-known/mcp-schema.json`.)
+
+You can customize these ports independently (for example, via environment variables or a JSON config file) so that both servers run on your desired ports.
+
 ## Examples
 
 ### Adding a Shell Command Task

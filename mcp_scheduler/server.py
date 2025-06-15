@@ -6,7 +6,16 @@ import sys
 import json
 import re
 import platform
+import os
+import asyncio
+import uvicorn
+import uvicorn.config
 from typing import Dict, List, Any, Optional
+import threading
+import time
+from fastapi import Request, FastAPI
+from fastapi.responses import JSONResponse
+import inspect
 
 from mcp.server.fastmcp import FastMCP, Context
 
@@ -16,6 +25,43 @@ from .config import Config
 from .utils import human_readable_cron
 
 logger = logging.getLogger(__name__)
+
+def tool_to_schema(tool):
+    """Serialize a tool (function) to a schema dict for the well-known endpoint."""
+    sig = inspect.signature(tool)
+    params = sig.parameters
+    required = [k for k, v in params.items() if v.default is inspect.Parameter.empty and k != 'self']
+    properties = {}
+    for k, v in params.items():
+        if k == 'self':
+            continue
+        param_type = str(v.annotation) if v.annotation != inspect.Parameter.empty else 'string'
+        # Map Python types to JSON Schema types
+        if param_type in ("<class 'int'>", 'int'):
+            json_type = 'integer'
+        elif param_type in ("<class 'bool'>", 'bool'):
+            json_type = 'boolean'
+        elif param_type in ("<class 'float'>", 'float'):
+            json_type = 'number'
+        elif param_type in ("<class 'dict'>", 'dict'):
+            json_type = 'object'
+        elif param_type in ("<class 'list'>", 'list'):
+            json_type = 'array'
+        else:
+            json_type = 'string'
+        properties[k] = {"type": json_type}
+    return {
+        "name": tool.__name__,
+        "description": tool.__doc__ or "",
+        "endpoint": tool.__name__,
+        "method": "POST",
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False
+        }
+    }
 
 class EnhancedJSONEncoder(json.JSONEncoder):
     """Custom JSON encoder that ensures arrays have proper comma separation."""
@@ -29,67 +75,33 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         return super().encode(obj)
 
 class CustomFastMCP(FastMCP):
-    """Enhanced FastMCP with better JSON handling."""
-    
-    def _write_response(self, response: Any) -> None:
-        """Override response writer to use enhanced JSON formatting."""
-        try:
-            # Format response with custom encoder
-            response_str = json.dumps(response, cls=EnhancedJSONEncoder, ensure_ascii=False)
-            # Ensure proper line ending
-            if not response_str.endswith('\n'):
-                response_str += '\n'
-            sys.stdout.write(response_str)
-            sys.stdout.flush()
-        except Exception as e:
-            logger.error(f"Error writing response: {e}")
-            # Write fallback error response
-            fallback = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32603, "message": "Internal error"}
-            }
-            sys.stdout.write(json.dumps(fallback) + '\n')
-            sys.stdout.flush()
+    """Custom FastMCP implementation that exposes a .app property for FastAPI mounting."""
+    def __init__(self, *args, transport="sse", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._transport = transport
+        # Initialize app based on transport type immediately
+        if transport == "sse":
+            self.app = self.sse_app()
+        elif transport == "streamable-http":
+            self.app = self.streamable_http_app()
+        else:
+            self.app = None
+        # Initialize tools list
+        self.tools = []
 
-    def _handle_stdin(self) -> None:
-        """Override stdin handler to improve JSON parsing."""
-        while True:
-            try:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                    
-                # Pre-process the line to fix common JSON issues
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Ensure array elements are properly comma-separated
-                if '[' in line and ']' in line:
-                    # Fix missing commas between array elements
-                    line = re.sub(r'}\s*{', '},{', line)
-                    line = re.sub(r']\s*\[', '],[', line)
-                    line = re.sub(r'"\s*"', '","', line)
-                
-                try:
-                    request = json.loads(line)
-                    self._handle_request(request)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Invalid JSON received: {e}")
-                    # Try to extract ID from malformed JSON
-                    id_match = re.search(r'"id"\s*:\s*(\d+)', line)
-                    id_val = id_match.group(1) if id_match else "null"
-                    # Send parse error response
-                    self._write_response({
-                        "jsonrpc": "2.0",
-                        "id": int(id_val) if id_val.isdigit() else None,
-                        "error": {"code": -32700, "message": "Parse error"}
-                    })
-            except Exception as e:
-                logger.error(f"Error handling stdin: {e}")
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Problematic line: {line}")
+    def tool(self, *args, **kwargs):
+        """Override tool decorator to track registered tools."""
+        def decorator(func):
+            # Get the original tool decorator from the parent class
+            original_tool = FastMCP.tool(self, *args, **kwargs)
+            # Apply the original decorator
+            tool = original_tool(func)
+            # Add to our tools list
+            if not hasattr(self, 'tools'):
+                self.tools = []
+            self.tools.append(tool)
+            return tool
+        return decorator
 
 class SchedulerServer:
     """MCP server for task scheduling."""
@@ -99,21 +111,68 @@ class SchedulerServer:
         self.scheduler = scheduler
         self.config = config
         
-        # Create MCP server with custom response formatting
-        self.mcp = CustomFastMCP(
-            config.server_name,
-            version=config.server_version,
-            dependencies=[
-                "croniter",
-                "pydantic",
-                "openai",
-                "aiohttp"
-            ]
+        # Configure Uvicorn logging and settings
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn"]["level"] = "WARNING"
+        uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(message)s"
+        
+        # Create main FastAPI application
+        self.app = FastAPI(
+            title=self.config.server_name,
+            version=self.config.server_version,
+            description="MCP Scheduler with well-known endpoint"
         )
         
-        # Register tools
+        # Create MCP server with custom response formatting
+        self.mcp = CustomFastMCP(
+            host=config.server_address,
+            port=config.server_port,
+            transport=config.transport
+        )
+        
+        # Register tools first
         self._register_tools()
-    
+        
+        # Mount MCP server at /mcp solo si hay app (solo para sse o streamable-http)
+        if self.mcp.app:
+            self.app.mount("/mcp", self.mcp.app)
+        elif self.config.transport in ("sse", "streamable-http"):
+            logger.error("MCP app not initialized - transport may not be supported")
+            raise RuntimeError("MCP transport not supported")
+        # Si es stdio, no montamos nada y no lanzamos excepción
+        
+        # Add well-known endpoint at root level
+        @self.app.get("/.well-known/mcp-schema.json")
+        async def well_known_handler(request: Request) -> JSONResponse:
+            """Handle requests to the well-known endpoint."""
+            try:
+                logger.warning(f"[DIAG] self.mcp: {self.mcp}")
+                logger.warning(f"[DIAG] hasattr(self.mcp, 'tools'): {hasattr(self.mcp, 'tools')}")
+                logger.warning(f"[DIAG] tools: {getattr(self.mcp, 'tools', None)}")
+                if not hasattr(self.mcp, 'tools'):
+                    logger.error("MCP tools not available")
+                    return JSONResponse(
+                        {"error": "MCP tools not available"},
+                        status_code=503
+                    )
+                # Convert tools to schema
+                mcp_tools = [tool_to_schema(tool) for tool in self.mcp.tools]
+                # Build response
+                response = {
+                    "name": self.config.server_name,
+                    "version": self.config.server_version,
+                    "tools": mcp_tools,
+                    "mcp_endpoint": f"/mcp"  # Add MCP endpoint location
+                }
+                return JSONResponse(response)
+            except Exception as e:
+                logger.error(f"Error in well-known handler: {e}")
+                return JSONResponse(
+                    {"error": "Internal server error"},
+                    status_code=500
+                )
+        
+        self._server_task = None
+
     def _format_json_response(self, data: Any) -> str:
         """Format JSON response to ensure compatibility with client."""
         try:
@@ -130,13 +189,16 @@ class SchedulerServer:
 
     def _register_tools(self):
         """Register MCP tools."""
-        
+        import logging
+        logger = logging.getLogger(__name__)
+
         @self.mcp.tool()
         async def list_tasks() -> List[Dict[str, Any]]:
             """List all scheduled tasks."""
             tasks = await self.scheduler.get_all_tasks()
             return [self._format_task_response(task) for task in tasks]
-        
+        logger.warning("[DIAG] Tool registrado: list_tasks")
+
         @self.mcp.tool()
         async def get_task(task_id: str) -> Optional[Dict[str, Any]]:
             """Get details of a specific task.
@@ -165,6 +227,7 @@ class SchedulerServer:
             ]
             
             return result
+        logger.warning("[DIAG] Tool registrado: get_task")
         
         @self.mcp.tool()
         async def add_command_task(
@@ -412,7 +475,7 @@ class SchedulerServer:
                 "execution_timeout": self.config.execution_timeout,
                 "ai_model": self.config.ai_model
             }
-    
+
     def _format_task_response(self, task: Task) -> Dict[str, Any]:
         """Format a task for API response."""
         result = {
@@ -453,20 +516,28 @@ class SchedulerServer:
         return result
             
     def start(self):
-        """Start the MCP server."""
-        print(f"Starting MCP server with {self.config.transport} transport", file=sys.stderr)
-        
-        try:
-            # For FastMCP, only valid transport options are "stdio" or "sse"
-            if self.config.transport == "stdio":
-                self.mcp.run(transport="stdio")
+        """Start the server."""
+        if self.config.transport == "sse":
+            # Set port via environment variable for Uvicorn
+            os.environ["UVICORN_PORT"] = str(self.config.server_port)
+            # Start the server using Uvicorn
+            uvicorn.run(
+                self.app,
+                host=self.config.server_address,
+                port=self.config.server_port,
+                log_level="warning"
+            )
+        elif self.config.transport == "stdio":
+            # Para stdio, usar run_stdio si existe
+            if hasattr(self.mcp, "run_stdio"):
+                self.mcp.run_stdio()
+            elif hasattr(self.mcp, "run"):
+                self.mcp.run()
             else:
-                self.mcp.run(
-                    transport="sse",
-                    host=self.config.server_address,
-                    port=self.config.server_port
-                )
-        except Exception as e:
-            logger.error(f"Error starting MCP server: {e}")
-            print(f"Error starting MCP server: {e}", file=sys.stderr)
-            raise
+                raise RuntimeError("FastMCP no soporta stdio en esta versión")
+        else:
+            # Para otros transportes, usar start si existe
+            if hasattr(self.mcp, "start"):
+                self.mcp.start()
+            else:
+                raise RuntimeError("FastMCP no soporta este transporte en esta versión")

@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import uuid
 import re
-from datetime import datetime
+from datetime import datetime, UTC
 from enum import Enum
 from typing import Literal, Optional, List, Dict, Any
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class TaskStatus(str, Enum):
@@ -54,44 +54,44 @@ class Task(BaseModel):
     last_run: Optional[datetime] = None
     next_run: Optional[datetime] = None
     status: TaskStatus = TaskStatus.PENDING
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     # Reminder-specific fields
     reminder_title: Optional[str] = None
     reminder_message: Optional[str] = None
 
-    @validator("name", "command", "prompt", "description", "reminder_title", "reminder_message", pre=True)
+    @field_validator("name", "command", "prompt", "description", "reminder_title", "reminder_message", mode="before")
     def validate_ascii_fields(cls, v):
         """Ensure all user-visible text fields contain only ASCII characters."""
         if isinstance(v, str):
             return sanitize_ascii(v)
         return v
 
-    @validator("command")
-    def validate_command(cls, v, values):
+    @field_validator("command")
+    def validate_command(cls, v, info):
         """Validate that a command is provided for shell_command tasks."""
-        if values.get("type") == TaskType.SHELL_COMMAND and not v:
-            raise ValueError("Command is required for shell_command tasks")
+        if info.data.get("type") == TaskType.SHELL_COMMAND and not v:
+            raise ValueError("A command must be provided for shell_command tasks.")
         return v
     
-    @validator("api_url")
-    def validate_api_url(cls, v, values):
+    @field_validator("api_url")
+    def validate_api_url(cls, v, info):
         """Validate that API URL is provided for api_call tasks."""
-        if values.get("type") == TaskType.API_CALL and not v:
-            raise ValueError("API URL is required for api_call tasks")
+        if info.data.get("type") == TaskType.API_CALL and not v:
+            raise ValueError("A API URL must be provided for api_call tasks.")
         return v
 
-    @validator("prompt")
-    def validate_prompt(cls, v, values):
+    @field_validator("prompt")
+    def validate_prompt(cls, v, info):
         """Validate that a prompt is provided for AI tasks."""
-        if values.get("type") == TaskType.AI and not v:
+        if info.data.get("type") == TaskType.AI and not v:
             raise ValueError("Prompt is required for AI tasks")
         return v
     
-    @validator("reminder_message")
-    def validate_reminder_message(cls, v, values):
+    @field_validator("reminder_message")
+    def validate_reminder_message(cls, v, info):
         """Validate that a message is provided for reminder tasks."""
-        if values.get("type") == TaskType.REMINDER and not v:
+        if info.data.get("type") == TaskType.REMINDER and not v:
             raise ValueError("Message is required for reminder tasks")
         return v
     
@@ -125,13 +125,13 @@ class TaskExecution(BaseModel):
     """Model representing a task execution."""
     id: str = Field(default_factory=lambda: f"exec_{uuid.uuid4().hex[:12]}")
     task_id: str
-    start_time: datetime = Field(default_factory=datetime.utcnow)
+    start_time: datetime = Field(default_factory=lambda: datetime.now(UTC))
     end_time: Optional[datetime] = None
     status: TaskStatus = TaskStatus.RUNNING
     output: Optional[str] = None
     error: Optional[str] = None
     
-    @validator("output", "error", pre=True)
+    @field_validator("output", "error", mode="before")
     def validate_ascii_output(cls, v):
         """Ensure output and error fields contain only ASCII characters."""
         if isinstance(v, str):

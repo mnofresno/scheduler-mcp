@@ -3,7 +3,7 @@ Task scheduler implementation for MCP Scheduler.
 """
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Dict, List, Optional
 
 import croniter
@@ -77,7 +77,7 @@ class Scheduler:
         """Check for tasks that need to be executed."""
         try:
             tasks = self.database.get_all_tasks()
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
             
             for task in tasks:
                 # Skip disabled tasks
@@ -113,7 +113,7 @@ class Scheduler:
         try:
             # Update task status
             task.status = TaskStatus.RUNNING
-            task.last_run = datetime.utcnow()
+            task.last_run = datetime.now(UTC)
             self.database.save_task(task)
             
             # Execute the task
@@ -128,7 +128,7 @@ class Scheduler:
                 self.database.save_task(task)
             else:
                 # Calculate next run time for recurring tasks or failed one-off tasks
-                now = datetime.utcnow()
+                now = datetime.now(UTC)
                 cron = croniter.croniter(task.schedule, now)
                 task.next_run = cron.get_next(datetime)
                 
@@ -146,8 +146,8 @@ class Scheduler:
             # Save execution record for the failure
             execution = TaskExecution(
                 task_id=task.id,
-                start_time=task.last_run or datetime.utcnow(),
-                end_time=datetime.utcnow(),
+                start_time=task.last_run or datetime.now(UTC),
+                end_time=datetime.now(UTC),
                 status=TaskStatus.FAILED,
                 error=str(e)
             )
@@ -161,7 +161,7 @@ class Scheduler:
     async def add_task(self, task: Task) -> Task:
         """Add a new task to the scheduler."""
         # Calculate initial next run time
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         try:
             cron = croniter.croniter(task.schedule, now)
             task.next_run = cron.get_next(datetime)
@@ -184,14 +184,14 @@ class Scheduler:
         
         # If schedule was updated, recalculate next run time
         if "schedule" in kwargs:
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
             try:
                 cron = croniter.croniter(task.schedule, now)
                 task.next_run = cron.get_next(datetime)
             except Exception as e:
                 raise ValueError(f"Invalid cron expression: {e}")
         
-        task.updated_at = datetime.utcnow()
+        task.updated_at = datetime.now(UTC)
         self.database.save_task(task)
         logger.info(f"Updated task: {task.id} ({task.name})")
         return task
@@ -242,7 +242,7 @@ class Scheduler:
         
         # Execute the task
         task.status = TaskStatus.RUNNING
-        task.last_run = datetime.utcnow()
+        task.last_run = datetime.now(UTC)
         self.database.save_task(task)
         
         execution = await self.executor.execute_task(task)
