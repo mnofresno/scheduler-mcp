@@ -354,6 +354,162 @@ http://localhost:8080/.well-known/mcp-schema.json
 
 This schema is generated automatically from the registered MCP tools and always reflects the current server capabilities.
 
+## Using the SSE API (Server-Sent Events)
+
+### Client Configuration
+
+To use the scheduler through SSE, you need to ensure that:
+
+1. The server is running in SSE mode:
+```bash
+python main.py --transport sse --port 8080
+```
+
+2. The client has access to the following endpoints:
+   - `http://<host>:<port>/.well-known/mcp-schema.json` - To discover available tools
+   - `http://<host>:<port>/mcp/sse` - For SSE connection
+   - `http://<host>:<port>/mcp/messages` - To send messages to the server
+
+### Example Usage with curl
+
+```bash
+# 1. First, get the schema
+curl http://localhost:8080/.well-known/mcp-schema.json
+
+# 2. Create a reminder task using the messages endpoint
+curl -X POST http://localhost:8080/mcp/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "add_reminder_task",
+    "params": {
+      "name": "Important Reminder",
+      "schedule": "*/1 * * * *",
+      "message": "Time for your reminder!",
+      "title": "Reminder",
+      "do_only_once": true
+    }
+  }'
+```
+
+### Example Usage with Python
+
+```python
+import asyncio
+import aiohttp
+import json
+
+async def schedule_reminder():
+    # Server base URL
+    base_url = "http://localhost:8080"
+    
+    # 1. Create the task using the messages endpoint
+    async with aiohttp.ClientSession() as session:
+        # Prepare JSON-RPC message
+        message = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "add_reminder_task",
+            "params": {
+                "name": "Reminder in 1 minute",
+                "schedule": "*/1 * * * *",  # Every minute
+                "message": "Time for your reminder!",
+                "title": "Important Reminder",
+                "do_only_once": true
+            }
+        }
+        
+        # Send the request
+        async with session.post(
+            f"{base_url}/mcp/messages",
+            json=message,
+            headers={"Content-Type": "application/json"}
+        ) as response:
+            result = await response.json()
+            print(f"Server response: {result}")
+
+# Run the example
+asyncio.run(schedule_reminder())
+```
+
+### Common Issues and Solutions
+
+1. **SSE Connection Error**
+   - Ensure the server is running and accessible
+   - Verify the port is open and not blocked by a firewall
+   - Check that the server URL is correct
+   - If using Docker, ensure containers are on the same network and ports are properly mapped
+
+2. **Schedule Format**
+   - Use valid cron expressions (e.g., `*/1 * * * *` for every minute)
+   - For one-time tasks, use `do_only_once: true`
+   - Common schedule examples:
+     - `*/1 * * * *` - Every minute
+     - `0 */1 * * *` - Every hour
+     - `0 0 * * *` - Once a day at midnight
+
+3. **Docker Configuration**
+   If using Docker, ensure your `docker-compose.yml` includes:
+
+```yaml
+services:
+  scheduler:
+    image: mcp-scheduler
+    ports:
+      - "8080:8080"
+    environment:
+      - MCP_SCHEDULER_TRANSPORT=sse
+      - MCP_SCHEDULER_PORT=8080
+      - MCP_SCHEDULER_ADDRESS=0.0.0.0
+    networks:
+      - mcp_network
+
+networks:
+  mcp_network:
+    driver: bridge
+```
+
+4. **Status Verification**
+   To verify the server is working correctly:
+
+```bash
+# Verify server response
+curl http://localhost:8080/.well-known/mcp-schema.json
+
+# Verify existing tasks
+curl -X POST http://localhost:8080/mcp/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "list_tasks",
+    "params": {}
+  }'
+```
+
+### Important Notes
+
+1. **Security**: 
+   - By default, the server listens on `0.0.0.0` when running in Docker
+   - In production, consider using HTTPS and authentication
+   - Limit access to necessary ports
+
+2. **Performance**:
+   - The SSE server maintains an open connection
+   - Consider the maximum number of simultaneous connections
+   - Monitor resource usage
+
+3. **Error Handling**:
+   - Implement automatic reconnection in the client
+   - Handle timeouts appropriately
+   - Verify server responses
+
+4. **Debugging**:
+   - Use `--debug` when starting the server for detailed logs
+   - Check server logs for specific errors
+   - Verify network connectivity between client and server
+
 ## Development
 
 If you want to contribute or develop the MCP Scheduler further, here are some additional commands:
@@ -393,3 +549,133 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Uses [croniter](https://github.com/kiorky/croniter) for cron parsing
 - Uses [OpenAI API](https://openai.com/blog/openai-api) for AI tasks
 - Uses [FastMCP](https://github.com/jlowin/fastmcp) for enhanced MCP functionality
+
+### MCP Client Configuration in Docker
+
+When using the scheduler in a Docker environment, special attention must be paid to the client configuration. Based on the server implementation and test cases, here's the correct setup:
+
+1. **Server Configuration (docker-compose.yml)**
+```yaml
+services:
+  scheduler_mcp:
+    image: ghcr.io/mnofresno/scheduler-mcp:0.0.1
+    restart: unless-stopped
+    environment:
+      - MCP_SCHEDULER_PORT=8085
+      - MCP_SCHEDULER_ADDRESS=0.0.0.0
+      - MCP_SCHEDULER_TRANSPORT=sse
+    networks:
+      - mcp_network
+
+networks:
+  mcp_network:
+    driver: bridge
+```
+
+2. **MCP Client Configuration**
+```json
+{
+  "id": "scheduler",
+  "server_url": "http://scheduler_mcp:8085",
+  "transport": "sse"
+}
+```
+
+3. **Available Endpoints**
+Based on the server implementation (`server.py`) and test cases (`test_well_known.py`), these are the ONLY valid endpoints:
+
+- Schema Discovery:
+  ```
+  http://scheduler_mcp:8085/.well-known/mcp-schema.json
+  ```
+- SSE Connection:
+  ```
+  http://scheduler_mcp:8085/mcp/sse
+  ```
+- Message Endpoint:
+  ```
+  http://scheduler_mcp:8085/mcp/messages
+  ```
+
+4. **Important Notes for Docker Setup**
+
+- **Network Configuration**:
+  - Both client and server containers MUST be on the same Docker network
+  - Use the container name (`scheduler_mcp`) as the hostname in URLs
+  - The port (8085) must match the `MCP_SCHEDULER_PORT` environment variable
+
+- **Schema Validation**:
+  - The server implements schema validation through `test_well_known.py`
+  - Only tools registered in `server.py` are available
+  - The schema endpoint (`/.well-known/mcp-schema.json`) is the source of truth for available tools
+
+- **Common Mistakes to Avoid**:
+  - Don't use `localhost` in Docker - use the container name
+  - Don't assume additional endpoints - only use the documented ones
+  - Don't modify the base paths (`/mcp/` and `/.well-known/`) - they are hardcoded in the server
+  - Don't use different ports than configured in the environment variables
+
+5. **Verification Steps**
+
+```bash
+# 1. Verify the schema endpoint is accessible
+curl http://scheduler_mcp:8085/.well-known/mcp-schema.json
+
+# 2. Verify the server is running and accessible
+curl -X POST http://scheduler_mcp:8085/mcp/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "get_server_info",
+    "params": {}
+  }'
+
+# 3. Check network connectivity
+docker exec your_client_container ping scheduler_mcp
+```
+
+6. **Troubleshooting Docker Issues**
+
+If you encounter connection issues:
+
+1. **Verify Network**:
+```bash
+# Check if containers are on the same network
+docker network inspect mcp_network
+
+# Check container logs
+docker logs scheduler_mcp
+```
+
+2. **Verify Port Mapping**:
+```bash
+# Check if the port is actually listening
+docker exec scheduler_mcp netstat -tulpn | grep 8085
+```
+
+3. **Check Environment Variables**:
+```bash
+# Verify environment variables in the container
+docker exec scheduler_mcp env | grep MCP_SCHEDULER
+```
+
+4. **Common Error Messages and Solutions**:
+
+```
+Error: "Connection refused"
+Solution: Verify container name and port in server_url
+
+Error: "SSE connection error"
+Solution: Check if MCP_SCHEDULER_TRANSPORT=sse is set
+
+Error: "Schema not found"
+Solution: Verify the /.well-known/mcp-schema.json endpoint is accessible
+```
+
+7. **Security Considerations**
+
+- The server listens on `0.0.0.0` by default in Docker
+- Use Docker networks to isolate the communication
+- Consider using Docker secrets for sensitive configuration
+- In production, consider adding authentication to the MCP endpoints
