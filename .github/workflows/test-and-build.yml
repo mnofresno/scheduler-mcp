@@ -31,7 +31,7 @@ jobs:
 
     - name: Run tests with coverage
       run: |
-        pytest tests/ --cov=mcp_scheduler --cov-report=term-missing
+        pytest --cov=mcp_scheduler --cov-report=term-missing
 
   build:
     name: Build Docker Image

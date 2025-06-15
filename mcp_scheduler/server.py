@@ -132,22 +132,19 @@ class SchedulerServer:
         # Register tools first
         self._register_tools()
         
-        # Mount MCP server at /mcp solo si hay app (solo para sse o streamable-http)
+        # Mount MCP server at /mcp only if the FastAPI app is available
         if self.mcp.app:
             self.app.mount("/mcp", self.mcp.app)
         elif self.config.transport in ("sse", "streamable-http"):
             logger.error("MCP app not initialized - transport may not be supported")
             raise RuntimeError("MCP transport not supported")
-        # Si es stdio, no montamos nada y no lanzamos excepción
+        # For stdio transport, nothing is mounted and no exception is raised
         
         # Add well-known endpoint at root level
         @self.app.get("/.well-known/mcp-schema.json")
         async def well_known_handler(request: Request) -> JSONResponse:
             """Handle requests to the well-known endpoint."""
             try:
-                logger.warning(f"[DIAG] self.mcp: {self.mcp}")
-                logger.warning(f"[DIAG] hasattr(self.mcp, 'tools'): {hasattr(self.mcp, 'tools')}")
-                logger.warning(f"[DIAG] tools: {getattr(self.mcp, 'tools', None)}")
                 if not hasattr(self.mcp, 'tools'):
                     logger.error("MCP tools not available")
                     return JSONResponse(
@@ -171,21 +168,7 @@ class SchedulerServer:
                     status_code=500
                 )
         
-        self._server_task = None
-
-    def _format_json_response(self, data: Any) -> str:
-        """Format JSON response to ensure compatibility with client."""
-        try:
-            # Use custom encoder for proper array formatting
-            return json.dumps(data, cls=EnhancedJSONEncoder, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Error formatting JSON response: {e}")
-            # Fallback to simple error response
-            return json.dumps({
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32603, "message": "Internal error"}
-            })
+        # nothing else to init
 
     def _register_tools(self):
         """Register MCP tools."""
@@ -197,7 +180,6 @@ class SchedulerServer:
             """List all scheduled tasks."""
             tasks = await self.scheduler.get_all_tasks()
             return [self._format_task_response(task) for task in tasks]
-        logger.warning("[DIAG] Tool registrado: list_tasks")
 
         @self.mcp.tool()
         async def get_task(task_id: str) -> Optional[Dict[str, Any]]:
@@ -227,7 +209,6 @@ class SchedulerServer:
             ]
             
             return result
-        logger.warning("[DIAG] Tool registrado: get_task")
         
         @self.mcp.tool()
         async def add_command_task(
@@ -528,16 +509,16 @@ class SchedulerServer:
                 log_level="warning"
             )
         elif self.config.transport == "stdio":
-            # Para stdio, usar run_stdio si existe
+            # For stdio transport, use run_stdio if available
             if hasattr(self.mcp, "run_stdio"):
                 self.mcp.run_stdio()
             elif hasattr(self.mcp, "run"):
                 self.mcp.run()
             else:
-                raise RuntimeError("FastMCP no soporta stdio en esta versión")
+                raise RuntimeError("FastMCP does not support stdio in this version")
         else:
-            # Para otros transportes, usar start si existe
+            # For other transports, use start if available
             if hasattr(self.mcp, "start"):
                 self.mcp.start()
             else:
-                raise RuntimeError("FastMCP no soporta este transporte en esta versión")
+                raise RuntimeError("FastMCP does not support this transport in this version")

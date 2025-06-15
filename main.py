@@ -244,50 +244,14 @@ def main():
         scheduler_thread.start()
         log_to_stderr(f"Scheduler started in background thread")
 
-        async def run_servers():
-            try:
-                log_to_stderr(f"[DIAG] MCP config: port={config.server_port}, transport={config.transport}")
-                log_to_stderr(f"Starting server on port {config.server_port} with {config.transport} transport")
-                log_to_stderr(f"MCP endpoint will be available at http://{config.server_address}:{config.server_port}/mcp")
-                log_to_stderr(f"Well-known endpoint will be available at http://{config.server_address}:{config.server_port}/.well-known/mcp-schema.json")
-                
-                loop = asyncio.get_running_loop()
-                mcp_task = loop.run_in_executor(None, server.start)
-                await asyncio.sleep(2)
-                
-                log_to_stderr("Server started, checking status...")
-                if not hasattr(server, 'mcp'):
-                    log_to_stderr("[ERROR] MCP server object not present")
-                    raise RuntimeError("MCP server not properly initialized (no mcp)")
-                if not hasattr(server.mcp, 'tools'):
-                    log_to_stderr("[ERROR] MCP server has no 'tools' attribute")
-                    raise RuntimeError("MCP server not properly initialized (no tools)")
-                log_to_stderr(f"[DIAG] server.mcp.tools: {getattr(server.mcp, 'tools', None)}")
-                if not server.mcp.tools:
-                    log_to_stderr("[WARNING] MCP server has no tools registered (tools list is empty)")
-                else:
-                    log_to_stderr(f"[DIAG] MCP server initialized with {len(server.mcp.tools)} tools")
-                while True:
-                    await asyncio.sleep(3600)
-            except Exception as e:
-                log_to_stderr(f"[FATAL] Error in run_servers: {e}")
-                if debug_mode:
-                    traceback.print_exc(file=sys.stderr)
-                raise
-
-        if config.transport == "sse":
-            try:
-                asyncio.run(run_servers())
-            except KeyboardInterrupt:
-                log_to_stderr("Interrupted by user")
-                sys.exit(0)
-            except Exception as e:
-                log_to_stderr(f"Error running servers: {e}")
-                if debug_mode:
-                    traceback.print_exc(file=sys.stderr)
-                sys.exit(1)
-        else:
+        try:
+            log_to_stderr(
+                f"Starting server on {config.server_address}:{config.server_port} using {config.transport} transport"
+            )
             server.start()
+        except KeyboardInterrupt:
+            log_to_stderr("Interrupted by user")
+            sys.exit(0)
         
     except KeyboardInterrupt:
         log_to_stderr("Interrupted by user")

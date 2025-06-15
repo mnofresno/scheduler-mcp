@@ -5,9 +5,9 @@
   "params": {
     "name": "Test Reminder",
     "schedule": "* * * * *",
-    "message": "¡Esto es una alerta de prueba!",
-    "title": "Alerta AI",
-    "description": "Recordatorio de prueba",
+    "message": "This is a test alert!",
+    "title": "AI Alert",
+    "description": "Test reminder",
     "enabled": true,
     "do_only_once": true
   }
