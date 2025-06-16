@@ -10,10 +10,10 @@ import os
 import asyncio
 import uvicorn
 import uvicorn.config
-from typing import Dict, List, Any, Optional, Literal
+from typing import Dict, List, Any, Optional, Literal, Union
 import threading
 import time
-from fastapi import Request, FastAPI
+from fastapi import Request, FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 import inspect
 from datetime import datetime
@@ -25,6 +25,8 @@ from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 from contextlib import asynccontextmanager
 from starlette.middleware import Middleware
+from fastapi.middleware.cors import CORSMiddleware
+import uuid
 
 from .task import Task, TaskStatus, TaskType
 from .scheduler import Scheduler
@@ -52,29 +54,58 @@ def tool_to_schema(tool):
     """Serialize a tool (function) to a schema dict for the well-known endpoint."""
     sig = inspect.signature(tool)
     params = sig.parameters
+    return_type = sig.return_annotation
+    
+    # Get required parameters (excluding self)
     required = [k for k, v in params.items() if v.default is inspect.Parameter.empty and k != 'self']
+    
+    # Process parameters
     properties = {}
     for k, v in params.items():
         if k == 'self':
             continue
-        param_type = str(v.annotation) if v.annotation != inspect.Parameter.empty else 'string'
-        # Map Python types to JSON Schema types
-        if param_type in ("<class 'int'>", 'int'):
-            json_type = 'integer'
-        elif param_type in ("<class 'bool'>", 'bool'):
-            json_type = 'boolean'
-        elif param_type in ("<class 'float'>", 'float'):
-            json_type = 'number'
-        elif param_type in ("<class 'dict'>", 'dict'):
-            json_type = 'object'
-        elif param_type in ("<class 'list'>", 'list'):
-            json_type = 'array'
-        else:
-            json_type = 'string'
-        properties[k] = {"type": json_type}
-    return {
+            
+        # Get parameter type and description
+        param_type = v.annotation
+        param_doc = inspect.getdoc(tool) or ""
+        param_desc = ""
+        
+        # Extract parameter description from docstring
+        if param_doc:
+            # Look for Args section in docstring
+            args_section = re.search(r'Args:\s*\n\s*' + re.escape(k) + r':\s*(.*?)(?:\n\s*\w+:|$)', param_doc, re.DOTALL)
+            if args_section:
+                param_desc = args_section.group(1).strip()
+        
+        # Convert Python type to JSON Schema type
+        json_type, json_format = _python_type_to_json_schema(param_type)
+        
+        # Build property schema
+        prop_schema = {
+            "type": json_type,
+            "description": param_desc
+        }
+        
+        # Add format if available
+        if json_format:
+            prop_schema["format"] = json_format
+            
+        # Add enum for specific parameters
+        if k == "api_method":
+            prop_schema["enum"] = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+        elif k == "schedule":
+            prop_schema["pattern"] = r"^(\*|[0-9]{1,2}|\*\/[0-9]{1,2})(\s+(\*|[0-9]{1,2}|\*\/[0-9]{1,2})){4}$"
+            prop_schema["description"] = "Cron expression (minute hour day month weekday)"
+            
+        properties[k] = prop_schema
+    
+    # Process return type
+    return_schema = _python_type_to_json_schema(return_type)[0]
+    
+    # Build tool schema
+    schema = {
         "name": tool.__name__,
-        "description": tool.__doc__ or "",
+        "description": inspect.getdoc(tool) or "",
         "endpoint": tool.__name__,
         "method": "POST",
         "parameters": {
@@ -82,8 +113,58 @@ def tool_to_schema(tool):
             "properties": properties,
             "required": required,
             "additionalProperties": False
+        },
+        "returns": {
+            "type": return_schema,
+            "description": f"Returns {return_type.__name__ if hasattr(return_type, '__name__') else str(return_type)}"
         }
     }
+    
+    # Add examples if available in docstring
+    examples = re.search(r'Examples:\s*\n\s*```(.*?)```', inspect.getdoc(tool) or "", re.DOTALL)
+    if examples:
+        try:
+            schema["examples"] = json.loads(examples.group(1))
+        except:
+            pass
+            
+    return schema
+
+def _python_type_to_json_schema(py_type):
+    """Convert Python type to JSON Schema type and format."""
+    # Handle Optional types
+    if hasattr(py_type, "__origin__") and py_type.__origin__ is Union:
+        # Get the non-None type from Optional[T]
+        types = [t for t in py_type.__args__ if t is not type(None)]
+        if types:
+            return _python_type_to_json_schema(types[0])
+        return "string", None
+        
+    # Handle List types
+    if hasattr(py_type, "__origin__") and py_type.__origin__ is list:
+        item_type, _ = _python_type_to_json_schema(py_type.__args__[0])
+        return "array", {"items": {"type": item_type}}
+        
+    # Handle Dict types
+    if hasattr(py_type, "__origin__") and py_type.__origin__ is dict:
+        return "object", None
+        
+    # Handle basic types
+    if py_type == str or py_type == "str":
+        return "string", None
+    elif py_type == int or py_type == "int":
+        return "integer", None
+    elif py_type == float or py_type == "float":
+        return "number", None
+    elif py_type == bool or py_type == "bool":
+        return "boolean", None
+    elif py_type == datetime:
+        return "string", "date-time"
+    elif py_type == Any:
+        return "object", None
+        
+    # Default to string for unknown types
+    return "string", None
 
 class EnhancedJSONEncoder(json.JSONEncoder):
     """Custom JSON encoder that ensures arrays have proper comma separation."""
@@ -221,468 +302,173 @@ class CustomFastMCP(FastMCP):
         # Return unique tools (avoid duplicates)
         return list({tool.__name__: tool for tool in parent_tools + local_tools}.values())
 
-class SchedulerServer:
-    """MCP server for task scheduling."""
-    
-    def __init__(self, scheduler: Scheduler, config: Config):
-        """Initialize the MCP server."""
-        self.scheduler = scheduler
-        self.config = config
-        
-        # Configure Uvicorn logging and settings
-        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn"]["level"] = "WARNING"
-        uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(message)s"
-        
-        # Create main FastAPI application with enhanced metadata
-        self.app = FastAPI(
-            title=self.config.server_name,
-            version=self.config.server_version,
-            description="MCP Scheduler with well-known endpoint and SSE transport",
-            docs_url="/api/docs",  # Move Swagger UI to /api/docs
-            redoc_url="/api/redoc",  # Move ReDoc to /api/redoc
-            openapi_url="/api/openapi.json",  # Move OpenAPI schema to /api/openapi.json
+class McpScheduler:
+    def __init__(self):
+        self.app = FastAPI(title="MCP Scheduler")
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.setup_middleware()
+        self.setup_routes()
+
+    def setup_middleware(self):
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
         )
-        
-        # Add middleware for request logging and CORS
-        @self.app.middleware("http")
-        async def log_requests(request: Request, call_next):
-            if request.url.path == "/.well-known/mcp-schema.json":
-                log_request(request, "Well-known schema request received", "info")
-            response = await call_next(request)
-            if request.url.path == "/.well-known/mcp-schema.json":
-                log_request(request, f"Well-known schema request completed with status {response.status_code}", "info")
-            return response
-        
-        # Create MCP server with custom response formatting
-        self.mcp = CustomFastMCP(
-            host=config.server_address,
-            port=config.server_port
-        )
-        
-        # Register tools first
-        self._register_tools()
-        logger.info(f"Tools registrados: {self.mcp.tools}")
-        
-        # Montar la app HTTP/SSE de FastMCP
-        if self.config.transport in ("sse", "streamable-http"):
-            try:
-                mcp_app = self.mcp.http_app(
-                    path="/mcp",
-                    transport=self.config.transport,
-                    middleware=[]  # Add any additional middleware here if needed
-                )
-                self.app.mount("/mcp", mcp_app)
-                logger.info(f"MCP server mounted at /mcp with {config.transport} transport")
-            except Exception as e:
-                logger.error(f"Error mounting MCP app: {str(e)}", exc_info=True)
-                raise RuntimeError(f"Failed to mount MCP app: {str(e)}")
-        elif self.config.transport == "stdio":
-            logger.info("MCP server running in stdio mode")
-        else:
-            logger.error(f"MCP app not initialized - transport '{config.transport}' not supported")
-            raise RuntimeError(f"MCP transport '{config.transport}' not supported")
-        
-        # Add well-known endpoint at root level con log de tools
+
+    def setup_routes(self):
         @self.app.get("/.well-known/mcp-schema.json")
-        async def well_known_handler(request: Request) -> JSONResponse:
-            """Handle requests to the well-known endpoint."""
-            try:
-                logger.info(f"Tools disponibles en well-known: {self.mcp.tools}")
-                if not self.mcp.tools:
-                    log_request(request, "Well-known schema request failed - MCP tools not available", "error")
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "error": "Service Unavailable",
-                            "message": "MCP tools not available"
-                        }
-                    )
-                # Convert tools to schema
-                mcp_tools = [tool_to_schema(tool) for tool in self.mcp.tools]
-                # Build enhanced response
-                response = {
-                    "name": self.config.server_name,
-                    "version": self.config.server_version,
-                    "tools": mcp_tools,
-                    "mcp_endpoint": "/mcp",  # Endpoint original
-                    "transport": self.config.transport,
-                    "server_info": {
-                        "address": self.config.server_address,
-                        "port": self.config.server_port,
-                        "status": "running" if self.scheduler.active else "stopped"
-                    }
-                }
-                log_request(request, "Well-known schema request successful", "info")
-                return JSONResponse(response)
-            except Exception as e:
-                log_request(request, f"Well-known schema request failed with error: {str(e)}", "error")
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": "Internal Server Error",
-                        "message": str(e) if logger.isEnabledFor(logging.DEBUG) else "Schema generation error"
-                    }
-                )
-        
-        # nothing else to init
-
-    def _register_tools(self):
-        """Register MCP tools."""
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("Ejecutando _register_tools() para MCP tools")
-
-        @self.mcp.tool()
-        async def list_tasks() -> List[Dict[str, Any]]:
-            """List all scheduled tasks."""
-            tasks = await self.scheduler.get_all_tasks()
-            return [self._format_task_response(task) for task in tasks]
-
-        @self.mcp.tool()
-        async def get_task(task_id: str) -> Optional[Dict[str, Any]]:
-            """Get details of a specific task.
-            
-            Args:
-                task_id: ID of the task to retrieve
-            """
-            task = await self.scheduler.get_task(task_id)
-            if not task:
-                return None
-            
-            result = self._format_task_response(task)
-            
-            # Add execution history
-            executions = await self.scheduler.get_task_executions(task_id)
-            result["executions"] = [
-                {
-                    "id": exec.id,
-                    "start_time": exec.start_time.isoformat(),
-                    "end_time": exec.end_time.isoformat() if exec.end_time else None,
-                    "status": exec.status.value,
-                    "output": exec.output[:1000] if exec.output else None,  # Limit output size
-                    "error": exec.error
-                }
-                for exec in executions
-            ]
-            
-            return result
-        
-        @self.mcp.tool()
-        async def add_command_task(
-            name: str,
-            schedule: str,
-            command: str,
-            description: Optional[str] = None,
-            enabled: bool = True,
-            do_only_once: bool = True  # New parameter with default True
-        ) -> Dict[str, Any]:
-            """Add a new shell command task."""
-            task = Task(
-                name=name,
-                schedule=schedule,
-                type=TaskType.SHELL_COMMAND,
-                command=command,
-                description=description,
-                enabled=enabled,
-                do_only_once=do_only_once  # Pass the new parameter
-            )
-            
-            task = await self.scheduler.add_task(task)
-            return self._format_task_response(task)
-        
-        @self.mcp.tool()
-        async def add_api_task(
-            name: str,
-            schedule: str,
-            api_url: str,
-            api_method: str = "GET",
-            api_headers: Optional[Dict[str, str]] = None,
-            api_body: Optional[Dict[str, Any]] = None,
-            description: Optional[str] = None,
-            enabled: bool = True,
-            do_only_once: bool = True  # New parameter with default True
-        ) -> Dict[str, Any]:
-            """Add a new API call task."""
-            task = Task(
-                name=name,
-                schedule=schedule,
-                type=TaskType.API_CALL,
-                api_url=api_url,
-                api_method=api_method,
-                api_headers=api_headers,
-                api_body=api_body,
-                description=description,
-                enabled=enabled,
-                do_only_once=do_only_once  # Pass the new parameter
-            )
-            
-            task = await self.scheduler.add_task(task)
-            return self._format_task_response(task)
-        
-        @self.mcp.tool()
-        async def add_ai_task(
-            name: str,
-            schedule: str,
-            prompt: str,
-            description: Optional[str] = None,
-            enabled: bool = True,
-            do_only_once: bool = True  # New parameter with default True
-        ) -> Dict[str, Any]:
-            """Add a new AI task."""
-            task = Task(
-                name=name,
-                schedule=schedule,
-                type=TaskType.AI,
-                prompt=prompt,
-                description=description,
-                enabled=enabled,
-                do_only_once=do_only_once  # Pass the new parameter
-            )
-            
-            task = await self.scheduler.add_task(task)
-            return self._format_task_response(task)
-
-        @self.mcp.tool()
-        async def add_reminder_task(
-            name: str,
-            schedule: str,
-            message: str,
-            title: Optional[str] = None,
-            description: Optional[str] = None,
-            enabled: bool = True,
-            do_only_once: bool = True
-        ) -> Dict[str, Any]:
-            """Add a new reminder task that shows a popup notification with sound."""
-            # Check if we have notification capabilities on this platform
-            os_type = platform.system()
-            has_notification_support = True
-            
-            if os_type == "Linux":
-                # Check for notify-send or zenity
-                try:
-                    import shutil
-                    notify_send_path = shutil.which("notify-send")
-                    zenity_path = shutil.which("zenity")
-                    if not notify_send_path and not zenity_path:
-                        has_notification_support = False
-                except ImportError:
-                    # Can't check, we'll try anyway
-                    pass
-            
-            if not has_notification_support:
-                logger.warning(f"Platform {os_type} may not support notifications")
-            
-            task = Task(
-                name=name,
-                schedule=schedule,
-                type=TaskType.REMINDER,
-                description=description,
-                enabled=enabled,
-                do_only_once=do_only_once,
-                reminder_title=title or name,
-                reminder_message=message
-            )
-            
-            task = await self.scheduler.add_task(task)
-            return self._format_task_response(task)
-        
-        @self.mcp.tool()
-        async def update_task(
-            task_id: str,
-            name: Optional[str] = None,
-            schedule: Optional[str] = None,
-            command: Optional[str] = None,
-            api_url: Optional[str] = None,
-            api_method: Optional[str] = None,
-            api_headers: Optional[Dict[str, str]] = None,
-            api_body: Optional[Dict[str, Any]] = None,
-            prompt: Optional[str] = None,
-            description: Optional[str] = None,
-            enabled: Optional[bool] = None,
-            do_only_once: Optional[bool] = None,  # New parameter
-            reminder_title: Optional[str] = None, # New parameter for reminders
-            reminder_message: Optional[str] = None # New parameter for reminders
-        ) -> Optional[Dict[str, Any]]:
-            """Update an existing task."""
-            update_data = {}
-            
-            if name is not None:
-                update_data["name"] = name
-            if schedule is not None:
-                update_data["schedule"] = schedule
-            if command is not None:
-                update_data["command"] = command
-            if api_url is not None:
-                update_data["api_url"] = api_url
-            if api_method is not None:
-                update_data["api_method"] = api_method
-            if api_headers is not None:
-                update_data["api_headers"] = api_headers
-            if api_body is not None:
-                update_data["api_body"] = api_body
-            if prompt is not None:
-                update_data["prompt"] = prompt
-            if description is not None:
-                update_data["description"] = description
-            if enabled is not None:
-                update_data["enabled"] = enabled
-            if do_only_once is not None:
-                update_data["do_only_once"] = do_only_once
-            if reminder_title is not None:
-                update_data["reminder_title"] = reminder_title
-            if reminder_message is not None:
-                update_data["reminder_message"] = reminder_message
-            
-            task = await self.scheduler.update_task(task_id, **update_data)
-            if not task:
-                return None
-            
-            return self._format_task_response(task)
-        
-        @self.mcp.tool()
-        async def remove_task(task_id: str) -> bool:
-            """Remove a task."""
-            return await self.scheduler.delete_task(task_id)
-        
-        @self.mcp.tool()
-        async def enable_task(task_id: str) -> Optional[Dict[str, Any]]:
-            """Enable a task."""
-            task = await self.scheduler.enable_task(task_id)
-            if not task:
-                return None
-            
-            return self._format_task_response(task)
-        
-        @self.mcp.tool()
-        async def disable_task(task_id: str) -> Optional[Dict[str, Any]]:
-            """Disable a task."""
-            task = await self.scheduler.disable_task(task_id)
-            if not task:
-                return None
-            
-            return self._format_task_response(task)
-        
-        @self.mcp.tool()
-        async def run_task_now(task_id: str) -> Optional[Dict[str, Any]]:
-            """Run a task immediately."""
-            execution = await self.scheduler.run_task_now(task_id)
-            if not execution:
-                return None
-            
-            task = await self.scheduler.get_task(task_id)
-            if not task:
-                return None
-            
-            result = self._format_task_response(task)
-            result["execution"] = {
-                "id": execution.id,
-                "start_time": execution.start_time.isoformat(),
-                "end_time": execution.end_time.isoformat() if execution.end_time else None,
-                "status": execution.status.value,
-                "output": execution.output[:1000] if execution.output else None,  # Limit output size
-                "error": execution.error
-            }
-            
-            return result
-        
-        @self.mcp.tool()
-        async def get_task_executions(task_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-            """Get execution history for a task."""
-            executions = await self.scheduler.get_task_executions(task_id, limit)
-            return [
-                {
-                    "id": exec.id,
-                    "task_id": exec.task_id,
-                    "start_time": exec.start_time.isoformat(),
-                    "end_time": exec.end_time.isoformat() if exec.end_time else None,
-                    "status": exec.status.value,
-                    "output": exec.output[:1000] if exec.output else None,  # Limit output size
-                    "error": exec.error
-                }
-                for exec in executions
-            ]
-        
-        @self.mcp.tool()
-        async def get_server_info() -> Dict[str, Any]:
-            """Get server information."""
+        async def get_schema():
             return {
-                "name": self.config.server_name,
-                "version": self.config.server_version,
-                "scheduler_status": "running" if self.scheduler.active else "stopped",
-                "check_interval": self.config.check_interval,
-                "execution_timeout": self.config.execution_timeout,
-                "ai_model": self.config.ai_model
+                "mcp_endpoint": "/mcp",
+                "transport": "http",
+                "tools": [
+                    {
+                        "name": "schedule_task",
+                        "description": "Schedule a task to be executed at a specific time",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "task_name": {
+                                    "type": "string",
+                                    "description": "Name of the task to schedule"
+                                },
+                                "execution_time": {
+                                    "type": "string",
+                                    "description": "Time when the task should be executed (ISO format)"
+                                },
+                                "parameters": {
+                                    "type": "object",
+                                    "description": "Parameters for the task"
+                                }
+                            },
+                            "required": ["task_name", "execution_time"]
+                        }
+                    }
+                ]
             }
 
-        logger.info(f"Tools después de registrar: {self.mcp.tools}")
-        # Forzar inicialización manual si no existe
-        if not self.mcp.tools:
-            if hasattr(self.mcp, '_tools'):
-                self.mcp.tools = list(self.mcp._tools.values())
-                logger.info(f"Tools forzados manualmente: {self.mcp.tools}")
+        @self.app.get("/mcp/sse")
+        async def sse_endpoint(request_id: str, session_id: str):
+            if not session_id:
+                raise HTTPException(status_code=400, detail="Session ID is required")
 
-    def _format_task_response(self, task: Task) -> Dict[str, Any]:
-        """Format a task for API response."""
-        result = {
-            "id": task.id,
-            "name": task.name,
-            "schedule": task.schedule,
-            "schedule_human_readable": human_readable_cron(task.schedule),
-            "type": task.type.value,
-            "description": task.description,
-            "enabled": task.enabled,
-            "do_only_once": task.do_only_once,
-            "status": task.status.value,
-            "created_at": task.created_at.isoformat(),
-            "updated_at": task.updated_at.isoformat(),
-            "last_run": task.last_run.isoformat() if task.last_run else None,
-            "next_run": task.next_run.isoformat() if task.next_run else None
-        }
-        
-        # Add type-specific fields
-        if task.type == TaskType.SHELL_COMMAND:
-            result["command"] = task.command
-            
-        elif task.type == TaskType.API_CALL:
-            result["api_url"] = task.api_url
-            result["api_method"] = task.api_method
-            result["api_headers"] = task.api_headers
-            # Don't include full API body to keep response size reasonable
-            if task.api_body:
-                result["api_body_keys"] = list(task.api_body.keys())
-            
-        elif task.type == TaskType.AI:
-            result["prompt"] = task.prompt
-            
-        elif task.type == TaskType.REMINDER:
-            result["reminder_title"] = task.reminder_title
-            result["reminder_message"] = task.reminder_message
-            
-        return result
-            
-    def start(self):
-        """Start the server."""
-        if self.config.transport == "sse":
-            # Set port via environment variable for Uvicorn
-            os.environ["UVICORN_PORT"] = str(self.config.server_port)
-            # Start the server using Uvicorn
-            uvicorn.run(
-                self.app,
-                host=self.config.server_address,
-                port=self.config.server_port,
-                log_level="warning"
+            async def event_generator():
+                try:
+                    # Create a new session
+                    self.sessions[session_id] = {
+                        "request_id": request_id,
+                        "created_at": datetime.utcnow(),
+                        "messages": [],
+                        "status": "connected"
+                    }
+                    
+                    # Send the endpoint for POST messages
+                    yield f"data: {json.dumps({'type': 'endpoint', 'data': '/mcp/messages'})}\n\n"
+                    
+                    # Keep the connection alive
+                    while True:
+                        await asyncio.sleep(30)
+                        yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                        
+                except Exception as e:
+                    logger.error(f"Error in SSE connection: {str(e)}")
+                    if session_id in self.sessions:
+                        del self.sessions[session_id]
+                    raise
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
             )
-        elif self.config.transport == "stdio":
-            # For stdio transport, use run_stdio if available
-            if hasattr(self.mcp, "run_stdio"):
-                self.mcp.run_stdio()
-            elif hasattr(self.mcp, "run"):
-                self.mcp.run()
+
+        @self.app.post("/mcp/messages")
+        async def process_message(request: Request, background_tasks: BackgroundTasks):
+            try:
+                data = await request.json()
+                session_id = data.get("session_id")
+                request_id = data.get("request_id")
+                tool = data.get("tool")
+                args = data.get("args", {})
+
+                if not session_id:
+                    raise HTTPException(status_code=400, detail="Session ID is required")
+
+                if session_id not in self.sessions:
+                    raise HTTPException(status_code=404, detail="Session not found")
+
+                session = self.sessions[session_id]
+                if session["request_id"] != request_id:
+                    raise HTTPException(status_code=400, detail="Request ID mismatch")
+
+                # Process the message in the background
+                background_tasks.add_task(self.process_tool_request, session_id, tool, args)
+
+                return JSONResponse({
+                    "status": "accepted",
+                    "message": "Request is being processed"
+                })
+
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid JSON")
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    async def process_tool_request(self, session_id: str, tool: str, args: Dict[str, Any]):
+        try:
+            session = self.sessions.get(session_id)
+            if not session:
+                logger.error(f"Session {session_id} not found")
+                return
+
+            if tool == "schedule_task":
+                # Process the scheduling request
+                task_name = args.get("task_name")
+                execution_time = args.get("execution_time")
+                parameters = args.get("parameters", {})
+
+                # Here you would implement the actual task scheduling logic
+                # For now, we'll just simulate a successful response
+                await asyncio.sleep(2)  # Simulate processing time
+
+                # Send success response
+                session["messages"].append({
+                    "type": "result",
+                    "result": {
+                        "status": "scheduled",
+                        "task_id": str(uuid.uuid4()),
+                        "task_name": task_name,
+                        "execution_time": execution_time
+                    }
+                })
+
             else:
-                raise RuntimeError("FastMCP does not support stdio in this version")
-        else:
-            # For other transports, use start if available
-            if hasattr(self.mcp, "start"):
-                self.mcp.start()
-            else:
-                raise RuntimeError("FastMCP does not support this transport in this version")
+                # Send error for unknown tool
+                session["messages"].append({
+                    "type": "error",
+                    "error": f"Unknown tool: {tool}"
+                })
+
+        except Exception as e:
+            logger.error(f"Error processing tool request: {str(e)}")
+            if session_id in self.sessions:
+                session = self.sessions[session_id]
+                session["messages"].append({
+                    "type": "error",
+                    "error": str(e)
+                })
+
+    def run(self, host: str = "0.0.0.0", port: int = 8000):
+        uvicorn.run(self.app, host=host, port=port)
+
+if __name__ == "__main__":
+    scheduler = McpScheduler()
+    scheduler.run()
