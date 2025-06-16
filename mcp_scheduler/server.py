@@ -7,7 +7,7 @@ import asyncio
 import uvicorn
 from datetime import datetime, UTC, timedelta
 from typing import Dict, List, Any, Optional, Set, Tuple
-from fastapi import Request, FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import Request, FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,16 +33,13 @@ class McpScheduler:
         self.scheduler = Scheduler(self.database, self.executor)
         self.setup_middleware()
         self.setup_routes()
-        # Mover las tareas asíncronas al evento de startup
-        @self.app.on_event("startup")
-        async def startup_event():
-            self.start_scheduler()
-            self.start_session_cleanup()
-            self.start_ai_task_cleanup()
-            self.start_health_check()
-            self.start_performance_monitoring()
-            self.start_metrics_collection()
-            self.start_error_recovery()
+        self.start_scheduler()
+        self.start_session_cleanup()
+        self.start_ai_task_cleanup()
+        self.start_health_check()
+        self.start_performance_monitoring()
+        self.start_metrics_collection()
+        self.start_error_recovery()
 
     def setup_middleware(self):
         self.app.add_middleware(
@@ -145,13 +142,14 @@ class McpScheduler:
             while True:
                 try:
                     # Verificar estado del scheduler
-                    if not self.scheduler.active:
+                    if not self.scheduler.is_running():
                         logger.warning("Scheduler is not running, attempting to restart")
                         await self.scheduler.start()
 
                     # Verificar conexiones de base de datos
-                    # La base de datos SQLite se reconecta automáticamente
-                    # No necesitamos verificar la conexión
+                    if not self.database.is_connected():
+                        logger.warning("Database connection lost, attempting to reconnect")
+                        self.database.reconnect()
 
                     # Verificar tareas pendientes
                     now = datetime.now(UTC)
@@ -181,13 +179,12 @@ class McpScheduler:
                     if pending_ai_tasks > 50:  # Ajustar según necesidades
                         logger.warning(f"High number of pending AI tasks: {pending_ai_tasks}")
 
-                    # Monitorear uso de memoria (sin psutil)
-                    # Comentamos esta funcionalidad por ahora
-                    # import psutil
-                    # process = psutil.Process()
-                    # memory_info = process.memory_info()
-                    # if memory_info.rss > 500 * 1024 * 1024:  # 500MB
-                    #     logger.warning(f"High memory usage: {memory_info.rss / 1024 / 1024:.2f}MB")
+                    # Monitorear uso de memoria
+                    import psutil
+                    process = psutil.Process()
+                    memory_info = process.memory_info()
+                    if memory_info.rss > 500 * 1024 * 1024:  # 500MB
+                        logger.warning(f"High memory usage: {memory_info.rss / 1024 / 1024:.2f}MB")
 
                     await asyncio.sleep(60)  # Check every minute
                 except Exception as e:
@@ -217,13 +214,8 @@ class McpScheduler:
                         task_status = task.status.value
                         task_metrics["by_status"][task_status] = task_metrics["by_status"].get(task_status, 0) + 1
 
-                    # Recolectar métricas de ejecuciones (usando el método correcto)
-                    # Solo obtenemos las primeras 1000 tareas y sus ejecuciones
-                    executions = []
-                    for task in tasks[:1000]:
-                        task_executions = self.database.get_executions(task.id, limit=10)
-                        executions.extend(task_executions)
-                    
+                    # Recolectar métricas de ejecuciones
+                    executions = self.database.get_recent_executions(limit=1000)
                     execution_metrics = {
                         "total": len(executions),
                         "by_status": {},
@@ -278,14 +270,13 @@ class McpScheduler:
             while True:
                 try:
                     # Verificar y recuperar tareas fallidas
-                    # Obtenemos todas las tareas y filtramos las fallidas
-                    all_tasks = await self.scheduler.get_all_tasks()
-                    failed_tasks = [task for task in all_tasks if task.status == TaskStatus.FAILED]
-                    
+                    failed_tasks = await self.scheduler.get_failed_tasks()
                     for task in failed_tasks:
-                        # Por ahora, solo loggeamos las tareas fallidas
-                        # En el futuro se puede implementar reintentos automáticos
-                        logger.warning(f"Found failed task {task.id}: {task.name}")
+                        if task.retry_count < 3:  # Máximo 3 intentos
+                            logger.info(f"Retrying failed task {task.id}")
+                            await self.scheduler.retry_task(task.id)
+                        else:
+                            logger.error(f"Task {task.id} failed permanently after 3 attempts")
 
                     # Verificar y recuperar sesiones inestables
                     unstable_sessions = [
@@ -362,8 +353,6 @@ class McpScheduler:
                     {
                         "name": "schedule_task",
                         "description": "Schedule a task to be executed at a specific time",
-                        "endpoint": "messages",
-                        "method": "POST",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -387,8 +376,6 @@ class McpScheduler:
                     {
                         "name": "list_tasks",
                         "description": "List all scheduled tasks",
-                        "endpoint": "messages",
-                        "method": "POST",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -400,8 +387,6 @@ class McpScheduler:
                     {
                         "name": "run_task",
                         "description": "Run a task immediately",
-                        "endpoint": "messages",
-                        "method": "POST",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -413,8 +398,6 @@ class McpScheduler:
                     {
                         "name": "execute_ai_task",
                         "description": "Execute an AI task and return the result",
-                        "endpoint": "messages",
-                        "method": "POST",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -429,18 +412,9 @@ class McpScheduler:
             }
 
         @self.app.get("/mcp/sse")
-        async def sse_endpoint(
-            request: Request, 
-            session_id: str = Query(None, description="Session ID"),
-            request_id: str = Query(None, description="Request ID")
-        ):
-            # Support both session_id and request_id parameters
-            if not session_id and not request_id:
-                raise HTTPException(status_code=400, detail="Session ID or Request ID is required")
-            
-            # Use request_id as session_id if session_id is not provided
-            if not session_id and request_id:
-                session_id = request_id
+        async def sse_endpoint(request: Request, session_id: str):
+            if not session_id:
+                raise HTTPException(status_code=400, detail="Session ID is required")
 
             async def event_generator():
                 try:
@@ -499,16 +473,9 @@ class McpScheduler:
         async def process_message(request: Request, background_tasks: BackgroundTasks):
             try:
                 data = await request.json()
-                
-                # Manejar formato JSON-RPC
-                if "jsonrpc" in data:
-                    session_id = data.get("id")
-                    tool = data.get("method")
-                    args = data.get("params", {})
-                else:
-                    session_id = data.get("session_id")
-                    tool = data.get("tool")
-                    args = data.get("args", {})
+                session_id = data.get("session_id")
+                tool = data.get("tool")
+                args = data.get("args", {})
 
                 if not session_id:
                     raise HTTPException(status_code=400, detail="Session ID is required")
