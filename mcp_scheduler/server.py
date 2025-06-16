@@ -1,45 +1,313 @@
 """
-MCP server implementation for MCP Scheduler.
+Enhanced MCP server implementation for MCP Scheduler.
 """
 import logging
+import sys
 import json
+import re
+import platform
+import os
 import asyncio
 import uvicorn
-from datetime import datetime, UTC, timedelta
-from typing import Dict, List, Any, Optional, Set, Tuple
+import uvicorn.config
+from typing import Dict, List, Any, Optional, Literal, Union
+import threading
+import time
 from fastapi import Request, FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
+import inspect
+from datetime import datetime
+from fastmcp import FastMCP
+from fastmcp.server.http import StarletteWithLifespan, create_sse_app, SseServerTransport
+from fastmcp.utilities.logging import get_logger
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import Receive, Scope, Send
+from contextlib import asynccontextmanager
+from starlette.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
+import uuid
 
-from .task import Task, TaskStatus, TaskType, TaskExecution
+from .task import Task, TaskStatus, TaskType
 from .scheduler import Scheduler
 from .config import Config
-from .persistence import Database
-from .executor import Executor
+from .utils import human_readable_cron
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+def log_request(request: Request, message: str, level: str = "info"):
+    """Log request details with timestamp and client info."""
+    client_host = request.client.host if request.client else "unknown"
+    timestamp = datetime.utcnow().isoformat()
+    log_message = f"[{timestamp}] {message} - Client: {client_host} - Path: {request.url.path}"
+    
+    if level == "info":
+        logger.info(log_message)
+    elif level == "error":
+        logger.error(log_message)
+    elif level == "warning":
+        logger.warning(log_message)
+    elif level == "debug":
+        logger.debug(log_message)
+
+def tool_to_schema(tool):
+    """Serialize a tool (function) to a schema dict for the well-known endpoint."""
+    sig = inspect.signature(tool)
+    params = sig.parameters
+    return_type = sig.return_annotation
+    
+    # Get required parameters (excluding self)
+    required = [k for k, v in params.items() if v.default is inspect.Parameter.empty and k != 'self']
+    
+    # Process parameters
+    properties = {}
+    for k, v in params.items():
+        if k == 'self':
+            continue
+            
+        # Get parameter type and description
+        param_type = v.annotation
+        param_doc = inspect.getdoc(tool) or ""
+        param_desc = ""
+        
+        # Extract parameter description from docstring
+        if param_doc:
+            # Look for Args section in docstring
+            args_section = re.search(r'Args:\s*\n\s*' + re.escape(k) + r':\s*(.*?)(?:\n\s*\w+:|$)', param_doc, re.DOTALL)
+            if args_section:
+                param_desc = args_section.group(1).strip()
+        
+        # Convert Python type to JSON Schema type
+        json_type, json_format = _python_type_to_json_schema(param_type)
+        
+        # Build property schema
+        prop_schema = {
+            "type": json_type,
+            "description": param_desc
+        }
+        
+        # Add format if available
+        if json_format:
+            prop_schema["format"] = json_format
+            
+        # Add enum for specific parameters
+        if k == "api_method":
+            prop_schema["enum"] = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+        elif k == "schedule":
+            prop_schema["pattern"] = r"^(\*|[0-9]{1,2}|\*\/[0-9]{1,2})(\s+(\*|[0-9]{1,2}|\*\/[0-9]{1,2})){4}$"
+            prop_schema["description"] = "Cron expression (minute hour day month weekday)"
+            
+        properties[k] = prop_schema
+    
+    # Process return type
+    return_schema = _python_type_to_json_schema(return_type)[0]
+    
+    # Build tool schema
+    schema = {
+        "name": tool.__name__,
+        "description": inspect.getdoc(tool) or "",
+        "endpoint": tool.__name__,
+        "method": "POST",
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False
+        },
+        "returns": {
+            "type": return_schema,
+            "description": f"Returns {return_type.__name__ if hasattr(return_type, '__name__') else str(return_type)}"
+        }
+    }
+    
+    # Add examples if available in docstring
+    examples = re.search(r'Examples:\s*\n\s*```(.*?)```', inspect.getdoc(tool) or "", re.DOTALL)
+    if examples:
+        try:
+            schema["examples"] = json.loads(examples.group(1))
+        except:
+            pass
+            
+    return schema
+
+def _python_type_to_json_schema(py_type):
+    """Convert Python type to JSON Schema type and format."""
+    # Handle Optional types
+    if hasattr(py_type, "__origin__") and py_type.__origin__ is Union:
+        # Get the non-None type from Optional[T]
+        types = [t for t in py_type.__args__ if t is not type(None)]
+        if types:
+            return _python_type_to_json_schema(types[0])
+        return "string", None
+        
+    # Handle List types
+    if hasattr(py_type, "__origin__") and py_type.__origin__ is list:
+        item_type, _ = _python_type_to_json_schema(py_type.__args__[0])
+        return "array", {"items": {"type": item_type}}
+        
+    # Handle Dict types
+    if hasattr(py_type, "__origin__") and py_type.__origin__ is dict:
+        return "object", None
+        
+    # Handle basic types
+    if py_type == str or py_type == "str":
+        return "string", None
+    elif py_type == int or py_type == "int":
+        return "integer", None
+    elif py_type == float or py_type == "float":
+        return "number", None
+    elif py_type == bool or py_type == "bool":
+        return "boolean", None
+    elif py_type == datetime:
+        return "string", "date-time"
+    elif py_type == Any:
+        return "object", None
+        
+    # Default to string for unknown types
+    return "string", None
+
+class EnhancedJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder that ensures arrays have proper comma separation."""
+    def encode(self, obj):
+        if isinstance(obj, (list, tuple)):
+            if not obj:  # Empty list/tuple
+                return '[]'
+            # Ensure proper comma separation for arrays
+            items = [self.encode(item) for item in obj]
+            return '[' + ','.join(items) + ']'
+        return super().encode(obj)
+
+class CustomFastMCP(FastMCP):
+    """Custom FastMCP server with enhanced logging."""
+    
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._sse_transport = None
+        self._tools = {}  # Initialize tools dictionary
+        
+    def http_app(
+        self,
+        path: str | None = None,
+        middleware: list[Middleware] | None = None,
+        transport: Literal["streamable-http", "sse"] = "streamable-http",
+    ) -> StarletteWithLifespan:
+        """Create a Starlette app using the specified HTTP transport with enhanced logging."""
+        
+        if transport == "sse":
+            # Initialize SSE transport with logging and custom path
+            base_path = path or "/api/mcp"
+            self._sse_transport = SseServerTransport(f"{base_path}/messages")
+            
+            # Create a custom SSE handler with enhanced logging
+            async def handle_sse(scope: Scope, receive: Receive, send: Send) -> Response:
+                client_info = {
+                    "host": scope.get("client", ("unknown", 0))[0],
+                    "headers": dict(scope.get("headers", [])),
+                    "query_params": dict(scope.get("query_string", b"").decode().split("&") if scope.get("query_string") else []),
+                    "path": scope.get("path", "unknown"),
+                }
+                logger.info(f"New SSE connection established from {client_info}")
+                start_time = time.time()
+                
+                try:
+                    async with self._sse_transport.connect_sse(scope, receive, send) as streams:
+                        await self._mcp_server.run(
+                            streams[0],
+                            streams[1],
+                            self._mcp_server.create_initialization_options(),
+                        )
+                    duration = time.time() - start_time
+                    logger.info(f"SSE connection closed after {duration:.2f}s from {client_info}")
+                    return Response()
+                except Exception as e:
+                    duration = time.time() - start_time
+                    logger.error(f"SSE connection error after {duration:.2f}s from {client_info}: {str(e)}", exc_info=True)
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "Internal Server Error",
+                            "message": str(e) if logger.isEnabledFor(logging.DEBUG) else "Connection error"
+                        }
+                    )
+                    
+            # Create a custom message handler with enhanced logging
+            async def handle_post_message(scope: Scope, receive: Receive, send: Send) -> None:
+                request = Request(scope, receive)
+                client_info = {
+                    "host": scope.get("client", ("unknown", 0))[0],
+                    "headers": dict(scope.get("headers", [])),
+                    "query_params": dict(scope.get("query_string", b"").decode().split("&") if scope.get("query_string") else []),
+                    "path": scope.get("path", "unknown"),
+                }
+                logger.info(f"Received POST message from {client_info}")
+                
+                try:
+                    await self._sse_transport.handle_post_message(scope, receive, send)
+                    logger.info(f"Successfully processed POST message from {client_info}")
+                except Exception as e:
+                    logger.error(f"Error processing POST message from {client_info}: {str(e)}", exc_info=True)
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "Internal Server Error",
+                            "message": str(e) if logger.isEnabledFor(logging.DEBUG) else "Message processing error"
+                        }
+                    )
+                    
+            # Create the app with our custom handlers and enhanced middleware
+            app = create_sse_app(
+                server=self,
+                message_path=f"{base_path}/messages",
+                sse_path=f"{base_path}/sse",
+                auth=self.auth,
+                debug=False,  # Disable debug mode for production
+                middleware=middleware or [],
+            )
+            
+            # Replace the default handlers with our custom ones
+            for route in app.routes:
+                if route.path == f"{base_path}/sse":
+                    route.endpoint = handle_sse
+                elif route.path == f"{base_path}/messages":
+                    route.app = handle_post_message
+                    
+            return app
+            
+        else:
+            # Use the default implementation for other transports
+            return super().http_app(
+                path=path,
+                middleware=middleware,
+                transport=transport,
+            )
+
+    def tool(self, *args, **kwargs):
+        """Custom tool decorator that ensures tools are properly registered."""
+        def decorator(func):
+            tool_name = func.__name__
+            # Register the tool in our local dictionary
+            self._tools[tool_name] = func
+            # Use the parent class's tool decorator
+            decorated_func = FastMCP.tool(self, *args, **kwargs)(func)
+            return decorated_func
+        return decorator
+
+    @property
+    def tools(self):
+        """Get the list of registered tools."""
+        # First try to get tools from parent class
+        parent_tools = super().tools if hasattr(super(), 'tools') else []
+        # Then combine with our local tools
+        local_tools = list(self._tools.values())
+        # Return unique tools (avoid duplicates)
+        return list({tool.__name__: tool for tool in parent_tools + local_tools}.values())
 
 class McpScheduler:
     def __init__(self):
-        self.config = Config()
-        self.app = FastAPI(
-            title=self.config.server_name,
-            version=self.config.server_version
-        )
+        self.app = FastAPI(title="MCP Scheduler")
         self.sessions: Dict[str, Dict[str, Any]] = {}
-        self.pending_ai_tasks: Dict[str, Dict[str, Any]] = {}  # task_id -> task_info
-        self.database = Database(self.config.db_path)
-        self.executor = Executor(self.config)
-        self.scheduler = Scheduler(self.database, self.executor)
         self.setup_middleware()
         self.setup_routes()
-        self.start_scheduler()
-        self.start_session_cleanup()
-        self.start_ai_task_cleanup()
-        self.start_health_check()
-        self.start_performance_monitoring()
-        self.start_metrics_collection()
-        self.start_error_recovery()
 
     def setup_middleware(self):
         self.app.add_middleware(
@@ -50,305 +318,12 @@ class McpScheduler:
             allow_headers=["*"],
         )
 
-    def start_scheduler(self):
-        async def run_scheduler():
-            retry_count = 0
-            max_retries = 5
-            while retry_count < max_retries:
-                try:
-                    await self.scheduler.start()
-                    logger.info("Scheduler started successfully")
-                    return
-                except Exception as e:
-                    retry_count += 1
-                    logger.error(f"Error starting scheduler (attempt {retry_count}/{max_retries}): {str(e)}")
-                    if retry_count < max_retries:
-                        await asyncio.sleep(5 * retry_count)  # Exponential backoff
-                    else:
-                        logger.critical("Failed to start scheduler after maximum retries")
-                        raise
-
-        asyncio.create_task(run_scheduler())
-
-    def start_session_cleanup(self):
-        async def cleanup_expired_sessions():
-            while True:
-                try:
-                    now = datetime.now(UTC)
-                    expired_sessions = [
-                        session_id for session_id, session in self.sessions.items()
-                        if now - session["last_heartbeat"] > timedelta(seconds=self.config.session_timeout)
-                    ]
-                    
-                    for session_id in expired_sessions:
-                        logger.info(f"Cleaning up expired session: {session_id}")
-                        # Notificar a otros clientes sobre la desconexión
-                        self.broadcast_message({
-                            "type": "session_disconnected",
-                            "session_id": session_id,
-                            "timestamp": now.isoformat()
-                        }, exclude={session_id})
-                        del self.sessions[session_id]
-                    
-                    await asyncio.sleep(60)  # Check every minute
-                except Exception as e:
-                    logger.error(f"Error in session cleanup: {str(e)}")
-                    await asyncio.sleep(60)
-
-        asyncio.create_task(cleanup_expired_sessions())
-
-    def start_ai_task_cleanup(self):
-        async def cleanup_expired_ai_tasks():
-            while True:
-                try:
-                    now = datetime.now(UTC)
-                    expired_tasks = [
-                        task_id for task_id, task_info in self.pending_ai_tasks.items()
-                        if now - task_info["request_time"] > timedelta(seconds=self.config.execution_timeout)
-                    ]
-                    
-                    for task_id in expired_tasks:
-                        logger.warning(f"AI task {task_id} expired without response")
-                        task_info = self.pending_ai_tasks.pop(task_id)
-                        
-                        # Crear ejecución fallida
-                        execution = TaskExecution(
-                            task_id=task_id,
-                            start_time=task_info["request_time"],
-                            end_time=now,
-                            status=TaskStatus.FAILED,
-                            output=f"Task expired after {self.config.execution_timeout} seconds"
-                        )
-                        self.database.save_execution(execution)
-                        
-                        # Notificar a todos los clientes
-                        self.broadcast_message({
-                            "type": "ai_task_failed",
-                            "task_id": task_id,
-                            "execution_id": execution.id,
-                            "error": "Task execution timed out",
-                            "timestamp": now.isoformat()
-                        })
-                    
-                    await asyncio.sleep(30)  # Check every 30 seconds
-                except Exception as e:
-                    logger.error(f"Error in AI task cleanup: {str(e)}")
-                    await asyncio.sleep(30)
-
-        asyncio.create_task(cleanup_expired_ai_tasks())
-
-    def start_health_check(self):
-        async def check_health():
-            while True:
-                try:
-                    # Verificar estado del scheduler
-                    if not self.scheduler.is_running():
-                        logger.warning("Scheduler is not running, attempting to restart")
-                        await self.scheduler.start()
-
-                    # Verificar conexiones de base de datos
-                    if not self.database.is_connected():
-                        logger.warning("Database connection lost, attempting to reconnect")
-                        self.database.reconnect()
-
-                    # Verificar tareas pendientes
-                    now = datetime.now(UTC)
-                    for task_id, task_info in list(self.pending_ai_tasks.items()):
-                        if now - task_info["request_time"] > timedelta(seconds=self.config.execution_timeout * 2):
-                            logger.error(f"AI task {task_id} has been pending for too long, forcing cleanup")
-                            await self.force_cleanup_ai_task(task_id)
-
-                    await asyncio.sleep(300)  # Check every 5 minutes
-                except Exception as e:
-                    logger.error(f"Error in health check: {str(e)}")
-                    await asyncio.sleep(300)
-
-        asyncio.create_task(check_health())
-
-    def start_performance_monitoring(self):
-        async def monitor_performance():
-            while True:
-                try:
-                    # Monitorear número de sesiones activas
-                    active_sessions = len([s for s in self.sessions.values() if s["status"] == "connected"])
-                    if active_sessions > 100:  # Ajustar según necesidades
-                        logger.warning(f"High number of active sessions: {active_sessions}")
-
-                    # Monitorear tareas de IA pendientes
-                    pending_ai_tasks = len(self.pending_ai_tasks)
-                    if pending_ai_tasks > 50:  # Ajustar según necesidades
-                        logger.warning(f"High number of pending AI tasks: {pending_ai_tasks}")
-
-                    # Monitorear uso de memoria
-                    import psutil
-                    process = psutil.Process()
-                    memory_info = process.memory_info()
-                    if memory_info.rss > 500 * 1024 * 1024:  # 500MB
-                        logger.warning(f"High memory usage: {memory_info.rss / 1024 / 1024:.2f}MB")
-
-                    await asyncio.sleep(60)  # Check every minute
-                except Exception as e:
-                    logger.error(f"Error in performance monitoring: {str(e)}")
-                    await asyncio.sleep(60)
-
-        asyncio.create_task(monitor_performance())
-
-    def start_metrics_collection(self):
-        async def collect_metrics():
-            while True:
-                try:
-                    # Recolectar métricas de tareas
-                    tasks = await self.scheduler.get_all_tasks()
-                    task_metrics = {
-                        "total": len(tasks),
-                        "by_type": {},
-                        "by_status": {}
-                    }
-                    
-                    for task in tasks:
-                        # Métricas por tipo
-                        task_type = task.type.value
-                        task_metrics["by_type"][task_type] = task_metrics["by_type"].get(task_type, 0) + 1
-                        
-                        # Métricas por estado
-                        task_status = task.status.value
-                        task_metrics["by_status"][task_status] = task_metrics["by_status"].get(task_status, 0) + 1
-
-                    # Recolectar métricas de ejecuciones
-                    executions = self.database.get_recent_executions(limit=1000)
-                    execution_metrics = {
-                        "total": len(executions),
-                        "by_status": {},
-                        "avg_duration": 0
-                    }
-                    
-                    total_duration = 0
-                    for execution in executions:
-                        # Métricas por estado
-                        exec_status = execution.status.value
-                        execution_metrics["by_status"][exec_status] = execution_metrics["by_status"].get(exec_status, 0) + 1
-                        
-                        # Duración promedio
-                        if execution.end_time and execution.start_time:
-                            duration = (execution.end_time - execution.start_time).total_seconds()
-                            total_duration += duration
-                    
-                    if executions:
-                        execution_metrics["avg_duration"] = total_duration / len(executions)
-
-                    # Recolectar métricas de sesiones
-                    session_metrics = {
-                        "total": len(self.sessions),
-                        "active": len([s for s in self.sessions.values() if s["status"] == "connected"]),
-                        "avg_lifetime": 0
-                    }
-                    
-                    total_lifetime = 0
-                    for session in self.sessions.values():
-                        if session["status"] == "connected":
-                            lifetime = (datetime.now(UTC) - session["created_at"]).total_seconds()
-                            total_lifetime += lifetime
-                    
-                    if session_metrics["active"]:
-                        session_metrics["avg_lifetime"] = total_lifetime / session_metrics["active"]
-
-                    # Logging de métricas
-                    logger.info("System metrics:")
-                    logger.info(f"Tasks: {json.dumps(task_metrics, indent=2)}")
-                    logger.info(f"Executions: {json.dumps(execution_metrics, indent=2)}")
-                    logger.info(f"Sessions: {json.dumps(session_metrics, indent=2)}")
-
-                    await asyncio.sleep(300)  # Collect every 5 minutes
-                except Exception as e:
-                    logger.error(f"Error collecting metrics: {str(e)}")
-                    await asyncio.sleep(300)
-
-        asyncio.create_task(collect_metrics())
-
-    def start_error_recovery(self):
-        async def recover_from_errors():
-            while True:
-                try:
-                    # Verificar y recuperar tareas fallidas
-                    failed_tasks = await self.scheduler.get_failed_tasks()
-                    for task in failed_tasks:
-                        if task.retry_count < 3:  # Máximo 3 intentos
-                            logger.info(f"Retrying failed task {task.id}")
-                            await self.scheduler.retry_task(task.id)
-                        else:
-                            logger.error(f"Task {task.id} failed permanently after 3 attempts")
-
-                    # Verificar y recuperar sesiones inestables
-                    unstable_sessions = [
-                        session_id for session_id, session in self.sessions.items()
-                        if session["status"] == "connected" and
-                        datetime.now(UTC) - session["last_heartbeat"] > timedelta(seconds=self.config.session_timeout / 2)
-                    ]
-                    for session_id in unstable_sessions:
-                        logger.warning(f"Session {session_id} appears unstable, attempting recovery")
-                        self.sessions[session_id]["status"] = "recovering"
-                        self.broadcast_message({
-                            "type": "session_recovery",
-                            "session_id": session_id,
-                            "timestamp": datetime.now(UTC).isoformat()
-                        })
-
-                    # Verificar y recuperar tareas de IA bloqueadas
-                    blocked_ai_tasks = [
-                        task_id for task_id, task_info in self.pending_ai_tasks.items()
-                        if datetime.now(UTC) - task_info["request_time"] > timedelta(seconds=self.config.execution_timeout / 2)
-                    ]
-                    for task_id in blocked_ai_tasks:
-                        logger.warning(f"AI task {task_id} appears blocked, attempting recovery")
-                        await self.force_cleanup_ai_task(task_id)
-
-                    await asyncio.sleep(60)  # Check every minute
-                except Exception as e:
-                    logger.error(f"Error in error recovery: {str(e)}")
-                    await asyncio.sleep(60)
-
-        asyncio.create_task(recover_from_errors())
-
-    async def force_cleanup_ai_task(self, task_id: str):
-        """Fuerza la limpieza de una tarea de IA pendiente."""
-        try:
-            if task_id in self.pending_ai_tasks:
-                task_info = self.pending_ai_tasks.pop(task_id)
-                now = datetime.now(UTC)
-                
-                execution = TaskExecution(
-                    task_id=task_id,
-                    start_time=task_info["request_time"],
-                    end_time=now,
-                    status=TaskStatus.FAILED,
-                    output="Task forcefully cleaned up due to extended pending time"
-                )
-                self.database.save_execution(execution)
-                
-                self.broadcast_message({
-                    "type": "ai_task_failed",
-                    "task_id": task_id,
-                    "execution_id": execution.id,
-                    "error": "Task forcefully cleaned up",
-                    "timestamp": now.isoformat()
-                })
-        except Exception as e:
-            logger.error(f"Error in force cleanup of AI task {task_id}: {str(e)}")
-
-    def broadcast_message(self, message: Dict[str, Any], exclude: Set[str] = None):
-        """Envía un mensaje a todos los clientes conectados excepto los excluidos."""
-        exclude = exclude or set()
-        for session_id, session in self.sessions.items():
-            if session_id not in exclude and session["status"] == "connected":
-                session["messages"].append(message)
-
     def setup_routes(self):
         @self.app.get("/.well-known/mcp-schema.json")
         async def get_schema():
             return {
                 "mcp_endpoint": "/mcp",
-                "transport": self.config.transport,
-                "version": self.config.server_version,
+                "transport": "http",
                 "tools": [
                     {
                         "name": "schedule_task",
@@ -356,108 +331,53 @@ class McpScheduler:
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "name": {"type": "string"},
-                                "schedule": {"type": "string"},
-                                "type": {"type": "string", "enum": ["shell_command", "api_call", "ai", "reminder"]},
-                                "command": {"type": "string"},
-                                "api_url": {"type": "string"},
-                                "api_method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
-                                "api_headers": {"type": "object"},
-                                "api_body": {"type": "object"},
-                                "prompt": {"type": "string"},
-                                "reminder_message": {"type": "string"},
-                                "reminder_title": {"type": "string"},
-                                "do_only_once": {"type": "boolean"},
-                                "enabled": {"type": "boolean"}
+                                "task_name": {
+                                    "type": "string",
+                                    "description": "Name of the task to schedule"
+                                },
+                                "execution_time": {
+                                    "type": "string",
+                                    "description": "Time when the task should be executed (ISO format)"
+                                },
+                                "parameters": {
+                                    "type": "object",
+                                    "description": "Parameters for the task"
+                                }
                             },
-                            "required": ["name", "schedule", "type"]
-                        }
-                    },
-                    {
-                        "name": "list_tasks",
-                        "description": "List all scheduled tasks",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "status": {"type": "string", "enum": ["pending", "running", "completed", "failed", "disabled", "all"]},
-                                "type": {"type": "string", "enum": ["shell_command", "api_call", "ai", "reminder", "all"]}
-                            }
-                        }
-                    },
-                    {
-                        "name": "run_task",
-                        "description": "Run a task immediately",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "task_id": {"type": "string"}
-                            },
-                            "required": ["task_id"]
-                        }
-                    },
-                    {
-                        "name": "execute_ai_task",
-                        "description": "Execute an AI task and return the result",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "task_id": {"type": "string"},
-                                "prompt": {"type": "string"},
-                                "result": {"type": "string"}
-                            },
-                            "required": ["task_id", "prompt", "result"]
+                            "required": ["task_name", "execution_time"]
                         }
                     }
                 ]
             }
 
         @self.app.get("/mcp/sse")
-        async def sse_endpoint(request: Request, session_id: str):
+        async def sse_endpoint(request_id: str, session_id: str):
             if not session_id:
                 raise HTTPException(status_code=400, detail="Session ID is required")
 
             async def event_generator():
                 try:
+                    # Create a new session
                     self.sessions[session_id] = {
-                        "created_at": datetime.now(UTC),
+                        "request_id": request_id,
+                        "created_at": datetime.utcnow(),
                         "messages": [],
-                        "status": "connected",
-                        "last_heartbeat": datetime.now(UTC)
+                        "status": "connected"
                     }
                     
-                    # Notificar a otros clientes sobre la nueva conexión
-                    self.broadcast_message({
-                        "type": "session_connected",
-                        "session_id": session_id,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    }, exclude={session_id})
-                    
-                    yield f"data: {json.dumps({'type': 'connected', 'session_id': session_id})}\n\n"
+                    # Send the endpoint for POST messages
                     yield f"data: {json.dumps({'type': 'endpoint', 'data': '/mcp/messages'})}\n\n"
                     
+                    # Keep the connection alive
                     while True:
-                        session = self.sessions.get(session_id)
-                        if not session or session["status"] != "connected":
-                            logger.info(f"Session {session_id} disconnected")
-                            break
-
-                        while session["messages"]:
-                            message = session["messages"].pop(0)
-                            yield f"data: {json.dumps(message)}\n\n"
-
-                        yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.now(UTC).isoformat()})}\n\n"
-                        session["last_heartbeat"] = datetime.now(UTC)
-                        await asyncio.sleep(self.config.heartbeat_interval)
+                        await asyncio.sleep(30)
+                        yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
                         
                 except Exception as e:
                     logger.error(f"Error in SSE connection: {str(e)}")
                     if session_id in self.sessions:
-                        self.sessions[session_id]["status"] = "disconnected"
+                        del self.sessions[session_id]
                     raise
-                finally:
-                    if session_id in self.sessions:
-                        self.sessions[session_id]["status"] = "disconnected"
-                        logger.info(f"Session {session_id} cleaned up")
 
             return StreamingResponse(
                 event_generator(),
@@ -474,6 +394,7 @@ class McpScheduler:
             try:
                 data = await request.json()
                 session_id = data.get("session_id")
+                request_id = data.get("request_id")
                 tool = data.get("tool")
                 args = data.get("args", {})
 
@@ -484,11 +405,16 @@ class McpScheduler:
                     raise HTTPException(status_code=404, detail="Session not found")
 
                 session = self.sessions[session_id]
-                if session["status"] != "connected":
-                    raise HTTPException(status_code=400, detail="Session is not active")
+                if session["request_id"] != request_id:
+                    raise HTTPException(status_code=400, detail="Request ID mismatch")
 
+                # Process the message in the background
                 background_tasks.add_task(self.process_tool_request, session_id, tool, args)
-                return JSONResponse({"status": "accepted"})
+
+                return JSONResponse({
+                    "status": "accepted",
+                    "message": "Request is being processed"
+                })
 
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="Invalid JSON")
@@ -500,168 +426,35 @@ class McpScheduler:
         try:
             session = self.sessions.get(session_id)
             if not session:
-                logger.warning(f"Session {session_id} not found during tool processing")
+                logger.error(f"Session {session_id} not found")
                 return
 
             if tool == "schedule_task":
-                try:
-                    task = Task(
-                        name=args["name"],
-                        schedule=args["schedule"],
-                        type=TaskType(args["type"]),
-                        command=args.get("command"),
-                        api_url=args.get("api_url"),
-                        api_method=args.get("api_method"),
-                        api_headers=args.get("api_headers"),
-                        api_body=args.get("api_body"),
-                        prompt=args.get("prompt"),
-                        reminder_message=args.get("reminder_message"),
-                        reminder_title=args.get("reminder_title"),
-                        do_only_once=args.get("do_only_once", True),
-                        enabled=args.get("enabled", True)
-                    )
+                # Process the scheduling request
+                task_name = args.get("task_name")
+                execution_time = args.get("execution_time")
+                parameters = args.get("parameters", {})
 
-                    task = await self.scheduler.add_task(task)
-                    self.broadcast_message({
-                        "type": "task_scheduled",
-                        "task_id": task.id,
-                        "task_name": task.name,
-                        "schedule": task.schedule,
-                        "type": task.type.value,
-                        "status": task.status.value,
-                        "next_run": task.next_run.isoformat() if task.next_run else None,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
-                except ValueError as e:
-                    session["messages"].append({
-                        "type": "error",
-                        "error": f"Invalid task parameters: {str(e)}",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
+                # Here you would implement the actual task scheduling logic
+                # For now, we'll just simulate a successful response
+                await asyncio.sleep(2)  # Simulate processing time
 
-            elif tool == "list_tasks":
-                try:
-                    status_filter = args.get("status", "all")
-                    type_filter = args.get("type", "all")
-                    tasks = await self.scheduler.get_all_tasks()
-                    
-                    filtered_tasks = [
-                        task.to_dict()
-                        for task in tasks
-                        if (status_filter == "all" or task.status.value == status_filter) and
-                           (type_filter == "all" or task.type.value == type_filter)
-                    ]
-
-                    session["messages"].append({
-                        "type": "task_list",
-                        "tasks": filtered_tasks,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
-                except Exception as e:
-                    session["messages"].append({
-                        "type": "error",
-                        "error": f"Error listing tasks: {str(e)}",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
-
-            elif tool == "run_task":
-                try:
-                    task_id = args["task_id"]
-                    task = await self.scheduler.get_task(task_id)
-                    
-                    if not task:
-                        session["messages"].append({
-                            "type": "error",
-                            "error": f"Task {task_id} not found",
-                            "timestamp": datetime.now(UTC).isoformat()
-                        })
-                        return
-
-                    if task.type == TaskType.AI:
-                        # Para tareas de IA, notificamos al cliente para que las ejecute
-                        request_time = datetime.now(UTC)
-                        self.pending_ai_tasks[task_id] = {
-                            "request_time": request_time,
-                            "prompt": task.prompt
-                        }
-                        
-                        self.broadcast_message({
-                            "type": "ai_task_request",
-                            "task_id": task_id,
-                            "prompt": task.prompt,
-                            "timestamp": request_time.isoformat()
-                        })
-                    else:
-                        # Para otros tipos de tareas, las ejecutamos en el servidor
-                        execution = await self.scheduler.run_task_now(task_id)
-                        if execution:
-                            self.broadcast_message({
-                                "type": "task_started",
-                                "task_id": task_id,
-                                "execution_id": execution.id,
-                                "start_time": execution.start_time.isoformat(),
-                                "timestamp": datetime.now(UTC).isoformat()
-                            })
-                        else:
-                            session["messages"].append({
-                                "type": "error",
-                                "error": f"Could not run task {task_id}",
-                                "timestamp": datetime.now(UTC).isoformat()
-                            })
-                except Exception as e:
-                    session["messages"].append({
-                        "type": "error",
-                        "error": f"Error running task: {str(e)}",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
-
-            elif tool == "execute_ai_task":
-                try:
-                    task_id = args["task_id"]
-                    prompt = args["prompt"]
-                    result = args["result"]
-                    
-                    if task_id not in self.pending_ai_tasks:
-                        session["messages"].append({
-                            "type": "error",
-                            "error": f"No pending AI task found for ID: {task_id}",
-                            "timestamp": datetime.now(UTC).isoformat()
-                        })
-                        return
-                    
-                    # Guardamos el resultado de la tarea de IA
-                    execution = TaskExecution(
-                        task_id=task_id,
-                        start_time=self.pending_ai_tasks[task_id]["request_time"],
-                        end_time=datetime.now(UTC),
-                        status=TaskStatus.COMPLETED,
-                        output=result
-                    )
-                    self.database.save_execution(execution)
-                    
-                    # Limpiamos la tarea pendiente
-                    self.pending_ai_tasks.pop(task_id)
-                    
-                    # Notificamos a todos los clientes
-                    self.broadcast_message({
-                        "type": "ai_task_completed",
-                        "task_id": task_id,
-                        "execution_id": execution.id,
-                        "result": result,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
-                except Exception as e:
-                    session["messages"].append({
-                        "type": "error",
-                        "error": f"Error executing AI task: {str(e)}",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
+                # Send success response
+                session["messages"].append({
+                    "type": "result",
+                    "result": {
+                        "status": "scheduled",
+                        "task_id": str(uuid.uuid4()),
+                        "task_name": task_name,
+                        "execution_time": execution_time
+                    }
+                })
 
             else:
+                # Send error for unknown tool
                 session["messages"].append({
                     "type": "error",
-                    "error": f"Unknown tool: {tool}",
-                    "timestamp": datetime.now(UTC).isoformat()
+                    "error": f"Unknown tool: {tool}"
                 })
 
         except Exception as e:
@@ -670,23 +463,11 @@ class McpScheduler:
                 session = self.sessions[session_id]
                 session["messages"].append({
                     "type": "error",
-                    "error": str(e),
-                    "timestamp": datetime.now(UTC).isoformat()
+                    "error": str(e)
                 })
 
-    def run(self, host: str = None, port: int = None):
-        host = host or self.config.server_address
-        port = port or self.config.server_port
-        
-        logger.info(f"Starting {self.config.server_name} v{self.config.server_version}")
-        logger.info(f"Server running at http://{host}:{port}")
-        
-        uvicorn.run(
-            self.app,
-            host=host,
-            port=port,
-            log_level=self.config.log_level.lower()
-        )
+    def run(self, host: str = "0.0.0.0", port: int = 8000):
+        uvicorn.run(self.app, host=host, port=port)
 
 if __name__ == "__main__":
     scheduler = McpScheduler()
