@@ -30,7 +30,7 @@ class McpScheduler:
         self.pending_ai_tasks: Dict[str, Dict[str, Any]] = {}  # task_id -> task_info
         self.database = Database(self.config.db_path)
         self.executor = Executor(self.config)
-        self.scheduler = Scheduler(self.database, self.executor)
+        self.scheduler = Scheduler(self.database, self.executor, on_task_executed=self.on_task_executed)
         self.setup_middleware()
         self.setup_routes()
         # Mover las tareas asíncronas al evento de startup
@@ -497,8 +497,11 @@ class McpScheduler:
 
         @self.app.post("/mcp/messages")
         async def process_message(request: Request, background_tasks: BackgroundTasks):
+            logger.info("=== ENDPOINT CALLED: /mcp/messages ===")
             try:
+                logger.info("Received POST request to /mcp/messages")
                 data = await request.json()
+                logger.info(f"Request data: {data}")
                 
                 # Manejar formato JSON-RPC
                 if "jsonrpc" in data:
@@ -510,34 +513,52 @@ class McpScheduler:
                     tool = data.get("tool")
                     args = data.get("args", {})
 
+                logger.info(f"Extracted: session_id={session_id}, tool={tool}, args={args}")
+
                 if not session_id:
+                    logger.error("Session ID is required but not provided")
                     raise HTTPException(status_code=400, detail="Session ID is required")
 
                 if session_id not in self.sessions:
+                    logger.error(f"Session {session_id} not found. Available sessions: {list(self.sessions.keys())}")
                     raise HTTPException(status_code=404, detail="Session not found")
 
                 session = self.sessions[session_id]
+                logger.info(f"Session {session_id} found, status: {session['status']}")
+                
                 if session["status"] != "connected":
+                    logger.error(f"Session {session_id} is not active, status: {session['status']}")
                     raise HTTPException(status_code=400, detail="Session is not active")
 
+                logger.info(f"Adding background task: process_tool_request({session_id}, {tool}, {args})")
                 background_tasks.add_task(self.process_tool_request, session_id, tool, args)
+                logger.info("Background task added successfully")
+                
+                # Agregar un log de confirmación inmediato
+                logger.info(f"Returning response for session {session_id}")
                 return JSONResponse({"status": "accepted"})
 
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON: {str(e)}")
                 raise HTTPException(status_code=400, detail="Invalid JSON")
             except Exception as e:
                 logger.error(f"Error processing message: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     async def process_tool_request(self, session_id: str, tool: str, args: Dict[str, Any]):
+        logger.info(f"=== BACKGROUND TASK STARTED: process_tool_request({session_id}, {tool}) ===")
         try:
+            logger.info(f"Processing tool request: session_id={session_id}, tool={tool}, args={args}")
             session = self.sessions.get(session_id)
             if not session:
                 logger.warning(f"Session {session_id} not found during tool processing")
                 return
 
+            logger.info(f"Session found: {session_id}, status: {session['status']}")
+
             if tool == "schedule_task":
                 try:
+                    logger.info(f"Creating task with args: {args}")
                     task = Task(
                         name=args["name"],
                         schedule=args["schedule"],
@@ -554,23 +575,39 @@ class McpScheduler:
                         enabled=args.get("enabled", True)
                     )
 
+                    logger.info(f"Adding task to scheduler: {task.name}")
                     task = await self.scheduler.add_task(task)
-                    self.broadcast_message({
-                        "type": "task_scheduled",
-                        "task_id": task.id,
-                        "task_name": task.name,
-                        "schedule": task.schedule,
-                        "type": task.type.value,
-                        "status": task.status.value,
-                        "next_run": task.next_run.isoformat() if task.next_run else None,
+                    logger.info(f"Task added successfully: {task.id}")
+                    
+                    response_message = {
+                        "type": "result",
+                        "result": {
+                            "task_id": task.id,
+                            "task_name": task.name,
+                            "schedule": task.schedule,
+                            "type": task.type.value,
+                            "status": task.status.value,
+                            "next_run": task.next_run.isoformat() if task.next_run else None,
+                            "message": f"Recordatorio '{task.name}' programado exitosamente para {task.next_run.strftime('%Y-%m-%d %H:%M:%S') if task.next_run else 'tiempo indefinido'}"
+                        },
                         "timestamp": datetime.now(UTC).isoformat()
-                    })
+                    }
+                    
+                    logger.info(f"Broadcasting result message: {response_message}")
+                    self.broadcast_message(response_message)
+                    
+                    # También agregar el mensaje a la sesión específica
+                    logger.info(f"Adding result message to session {session_id}")
+                    session["messages"].append(response_message)
+                    
                 except ValueError as e:
-                    session["messages"].append({
+                    error_message = {
                         "type": "error",
                         "error": f"Invalid task parameters: {str(e)}",
                         "timestamp": datetime.now(UTC).isoformat()
-                    })
+                    }
+                    logger.error(f"Task creation failed: {str(e)}")
+                    session["messages"].append(error_message)
 
             elif tool == "list_tasks":
                 try:
@@ -706,6 +743,26 @@ class McpScheduler:
                     "error": str(e),
                     "timestamp": datetime.now(UTC).isoformat()
                 })
+
+    def on_task_executed(self, task, execution):
+        logger.info(f"[on_task_executed] Callback called for task {task.id} ({task.name}), type={task.type}, status={execution.status}")
+        # Emitir mensaje SSE de tipo 'result' si es un recordatorio ejecutado exitosamente
+        if task.type == TaskType.REMINDER and execution.status == TaskStatus.COMPLETED:
+            result_message = {
+                "type": "result",
+                "result": {
+                    "task_id": task.id,
+                    "task_name": task.name,
+                    "schedule": task.schedule,
+                    "type": task.type.value,
+                    "status": task.status.value,
+                    "message": task.reminder_message,
+                    "executed_at": execution.end_time.isoformat() if execution.end_time else None
+                },
+                "timestamp": datetime.now(UTC).isoformat()
+            }
+            logger.info(f"[on_task_executed] Emitting SSE result message: {result_message}")
+            self.broadcast_message(result_message)
 
     def run(self, host: str = None, port: int = None):
         host = host or self.config.server_address

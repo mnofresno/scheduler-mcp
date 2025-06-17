@@ -4,7 +4,8 @@ Utility functions for MCP Scheduler.
 import logging
 import sys
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+import re
 
 
 def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
@@ -103,3 +104,104 @@ def human_readable_cron(cron_expression: str) -> str:
         
     except Exception:
         return cron_expression
+
+
+def parse_relative_time_to_cron(relative_time: str) -> str:
+    """
+    Parse a relative time expression and convert it to a cron expression.
+    
+    Examples:
+        "in 15 seconds" -> cron for 15 seconds from now
+        "in 1 minute" -> cron for 1 minute from now
+        "in 2 hours" -> cron for 2 hours from now
+        "in 1 day" -> cron for 1 day from now
+        "15 seconds" -> cron for 15 seconds from now
+        "1 minute" -> cron for 1 minute from now
+        "2023-10-06T17:09:05.000Z" -> cron for specific datetime
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"=== PARSING RELATIVE TIME: '{relative_time}' ===")
+    
+    # First, try to parse as ISO timestamp
+    try:
+        from datetime import datetime
+        import re
+        
+        # Check if it's an ISO timestamp
+        iso_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?$'
+        if re.match(iso_pattern, relative_time):
+            logger.info(f"Detected ISO timestamp: {relative_time}")
+            # Parse the ISO timestamp
+            if relative_time.endswith('Z'):
+                target_time = datetime.fromisoformat(relative_time[:-1])
+            else:
+                target_time = datetime.fromisoformat(relative_time)
+            
+            # For specific timestamps, we need to use a different approach
+            # since cron expressions don't handle specific dates well
+            # We'll use a relative approach based on current time
+            now = datetime.now()
+            time_diff = target_time - now
+            
+            if time_diff.total_seconds() <= 0:
+                # If the time has already passed, schedule for next occurrence
+                # For now, just schedule for 1 minute from now
+                target_time = now + timedelta(minutes=1)
+            
+            # Convert to cron expression: minute hour day month day_of_week (5 columns)
+            # Use * for day and month to make it relative to current date
+            cron_expr = f"{target_time.minute} {target_time.hour} * * *"
+            logger.info(f"Generated cron expression from ISO: '{cron_expr}'")
+            return cron_expr
+    except Exception as e:
+        logger.info(f"Not an ISO timestamp: {e}")
+    
+    # Remove "in " prefix if present
+    time_str = relative_time.lower().strip()
+    if time_str.startswith("in "):
+        time_str = time_str[3:]
+    
+    logger.info(f"After removing 'in ' prefix: '{time_str}'")
+    
+    # Parse patterns like "15 seconds", "1 minute", "2 hours", "1 day"
+    patterns = [
+        (r"(\d+)\s*second", "seconds"),
+        (r"(\d+)\s*minute", "minutes"), 
+        (r"(\d+)\s*hour", "hours"),
+        (r"(\d+)\s*day", "days"),
+        # Spanish patterns
+        (r"(\d+)\s*segundo", "seconds"),
+        (r"(\d+)\s*minuto", "minutes"),
+        (r"(\d+)\s*hora", "hours"),
+        (r"(\d+)\s*día", "days"),
+        (r"(\d+)\s*dia", "days")  # Without accent
+    ]
+    
+    for pattern, unit in patterns:
+        match = re.match(pattern, time_str)
+        if match:
+            amount = int(match.group(1))
+            logger.info(f"Matched pattern '{pattern}' with amount={amount}, unit={unit}")
+            now = datetime.now()
+            
+            if unit == "seconds":
+                target_time = now + timedelta(seconds=amount)
+            elif unit == "minutes":
+                target_time = now + timedelta(minutes=amount)
+            elif unit == "hours":
+                target_time = now + timedelta(hours=amount)
+            elif unit == "days":
+                target_time = now + timedelta(days=amount)
+            else:
+                raise ValueError(f"Unsupported time unit: {unit}")
+            
+            # Convert to cron expression: minute hour day month day_of_week (5 columns)
+            # Use * for day and month to make it relative to current date
+            cron_expr = f"{target_time.minute} {target_time.hour} * * *"
+            logger.info(f"Generated cron expression: '{cron_expr}'")
+            return cron_expr
+    
+    # If no pattern matches, assume it's already a cron expression
+    logger.info(f"No pattern matched, returning original: '{relative_time}'")
+    return relative_time
