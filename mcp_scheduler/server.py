@@ -746,7 +746,21 @@ class McpScheduler:
 
     def on_task_executed(self, task, execution):
         logger.info(f"[on_task_executed] Callback called for task {task.id} ({task.name}), type={task.type}, status={execution.status}")
-        # Emitir mensaje SSE de tipo 'result' si es un recordatorio ejecutado exitosamente
+        # Emitir mensaje SSE de tipo 'reminder' si es un recordatorio ejecutado exitosamente
+        if task.type == TaskType.REMINDER and execution.status == TaskStatus.COMPLETED:
+            reminder_message = {
+                "type": "reminder",
+                "reminder": {
+                    "task_id": task.id,
+                    "task_name": task.name,
+                    "message": task.reminder_message,
+                    "executed_at": execution.end_time.isoformat() if execution.end_time else None
+                },
+                "timestamp": datetime.now(UTC).isoformat()
+            }
+            logger.info(f"[on_task_executed] Emitting SSE reminder message: {reminder_message}")
+            self.broadcast_message(reminder_message)
+        # (opcional) Mantener el mensaje 'result' si lo necesitas para otros flujos
         if task.type == TaskType.REMINDER and execution.status == TaskStatus.COMPLETED:
             result_message = {
                 "type": "result",
