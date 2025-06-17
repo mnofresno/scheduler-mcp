@@ -149,9 +149,10 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
                 # For now, just schedule for 1 minute from now
                 target_time = now + timedelta(minutes=1)
             
-            # PATCH: Generar cron solo para minuto y hora, sin fijar día/mes, para ejecución inmediata
+            # Convert to cron expression: minute hour day month day_of_week (5 columns)
+            # Use * for day and month to make it relative to current date
             cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-            logger.info(f"Generated cron expression (immediate, 5 cols): '{cron_expr}'")
+            logger.info(f"Generated cron expression from ISO: '{cron_expr}'")
             return cron_expr
     except Exception as e:
         logger.info(f"Not an ISO timestamp: {e}")
@@ -183,7 +184,7 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
             amount = int(match.group(1))
             logger.info(f"Matched pattern '{pattern}' with amount={amount}, unit={unit}")
             now = datetime.now()
-
+            
             if unit == "seconds":
                 target_time = now + timedelta(seconds=amount)
             elif unit == "minutes":
@@ -194,14 +195,11 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
                 target_time = now + timedelta(days=amount)
             else:
                 raise ValueError(f"Unsupported time unit: {unit}")
-
-            # Si el target_time es hoy, solo usar minuto y hora, y comodines para día/mes
-            if target_time.date() == now.date():
-                cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-            else:
-                # Si es otro día, usar día y mes
-                cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
-            logger.info(f"Generated cron expression (smart): '{cron_expr}'")
+            
+            # Convert to cron expression: minute hour day month day_of_week (5 columns)
+            # Use * for day and month to make it relative to current date
+            cron_expr = f"{target_time.minute} {target_time.hour} * * *"
+            logger.info(f"Generated cron expression: '{cron_expr}'")
             return cron_expr
     
     # If no pattern matches, assume it's already a cron expression
