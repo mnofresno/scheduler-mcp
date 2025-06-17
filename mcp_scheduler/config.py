@@ -31,6 +31,13 @@ class Config:
         self.check_interval = int(os.environ.get("MCP_SCHEDULER_CHECK_INTERVAL", "5"))
         self.execution_timeout = int(os.environ.get("MCP_SCHEDULER_EXECUTION_TIMEOUT", "300"))
         
+        # Base path para endpoints
+        self.base_path = os.environ.get("MCP_SCHEDULER_BASE_PATH", "/mcp")
+        
+        # Heartbeat configuration
+        self.heartbeat_interval = int(os.environ.get("MCP_SCHEDULER_HEARTBEAT_INTERVAL", "30"))
+        self.session_timeout = int(os.environ.get("MCP_SCHEDULER_SESSION_TIMEOUT", "300"))
+        
         # AI configuration
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", None)
         self.ai_model = os.environ.get("MCP_SCHEDULER_AI_MODEL", "gpt-4")  # Fixed model name
@@ -69,6 +76,13 @@ class Config:
             self.check_interval = config.get("scheduler", {}).get("check_interval", self.check_interval)
             self.execution_timeout = config.get("scheduler", {}).get("execution_timeout", self.execution_timeout)
             
+            # Base path para endpoints
+            self.base_path = config.get("scheduler", {}).get("base_path", self.base_path)
+            
+            # Heartbeat configuration
+            self.heartbeat_interval = config.get("scheduler", {}).get("heartbeat_interval", self.heartbeat_interval)
+            self.session_timeout = config.get("scheduler", {}).get("session_timeout", self.session_timeout)
+            
             # AI configuration
             self.openai_api_key = config.get("ai", {}).get("openai_api_key", self.openai_api_key)
             self.ai_model = config.get("ai", {}).get("model", self.ai_model)
@@ -96,7 +110,10 @@ class Config:
             },
             "scheduler": {
                 "check_interval": self.check_interval,
-                "execution_timeout": self.execution_timeout
+                "execution_timeout": self.execution_timeout,
+                "base_path": self.base_path,
+                "heartbeat_interval": self.heartbeat_interval,
+                "session_timeout": self.session_timeout
             },
             "ai": {
                 "model": self.ai_model,

@@ -16,7 +16,7 @@ from mcp_scheduler.config import Config
 from mcp_scheduler.persistence import Database
 from mcp_scheduler.executor import Executor
 from mcp_scheduler.scheduler import Scheduler
-from mcp_scheduler.server import SchedulerServer
+from mcp_scheduler.server import McpScheduler
 from mcp_scheduler.utils import setup_logging
 
 # Import our custom JSON parser utilities
@@ -211,16 +211,13 @@ def main():
         database = Database(config.db_path)
         executor = Executor(None, config.ai_model)
         scheduler = Scheduler(database, executor)
-        server = SchedulerServer(scheduler, config)
         
-        # Start scheduler in background thread
-        scheduler_thread = threading.Thread(target=run_loop, daemon=True)
-        scheduler_thread.start()
-        log_to_stderr("Scheduler started in background thread")
+        # Asegurarse de que el path base sea correcto
+        if not config.base_path:
+            config.base_path = "/mcp"
         
-        # Start server
-        log_to_stderr(f"Starting server on {config.server_address}:{config.server_port} using {config.transport} transport")
-        server.start()
+        server = McpScheduler()
+        server.run()
 
     except KeyboardInterrupt:
         log_to_stderr("Interrupted by user")
