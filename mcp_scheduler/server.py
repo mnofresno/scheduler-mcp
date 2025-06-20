@@ -10,7 +10,6 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 from fastapi import Request, FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 
 from .task import Task, TaskStatus, TaskType, TaskExecution
 from .scheduler import Scheduler
@@ -23,9 +22,20 @@ logger = logging.getLogger(__name__)
 class McpScheduler:
     def __init__(self, database: Database, executor: Executor):
         self.config = Config()
-        # Usar lifespan en vez de on_event
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
+        self.app = FastAPI(
+            title=self.config.server_name,
+            version=self.config.server_version
+        )
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.pending_ai_tasks: Dict[str, Dict[str, Any]] = {}  # task_id -> task_info
+        self.database = database
+        self.executor = executor
+        self.scheduler = Scheduler(self.database, self.executor, on_task_executed=self.on_task_executed)
+        self.setup_middleware()
+        self.setup_routes()
+        # Mover las tareas asíncronas al evento de startup
+        @self.app.on_event("startup")
+        async def startup_event():
             self.start_scheduler()
             self.start_session_cleanup()
             self.start_ai_task_cleanup()
@@ -33,21 +43,6 @@ class McpScheduler:
             self.start_performance_monitoring()
             self.start_metrics_collection()
             self.start_error_recovery()
-            yield
-        self.app = FastAPI(
-            title=self.config.server_name,
-            version=self.config.server_version,
-            lifespan=lifespan
-        )
-        self.sessions: Dict[str, Dict[str, Any]] = {}
-        self.client_to_sessions: Dict[str, set] = {}  # client_request_id -> set of session_ids
-        self.persistent_sessions: set = set()  # session_ids marcadas como persistentes
-        self.database = database
-        self.executor = executor
-        self.scheduler = Scheduler(self.database, self.executor, on_task_executed=self.on_task_executed)
-        self.pending_ai_tasks = {}  # Inicializar tareas IA pendientes
-        self.setup_middleware()
-        self.setup_routes()
 
     def setup_middleware(self):
         self.app.add_middleware(
@@ -366,86 +361,27 @@ class McpScheduler:
                 "tools": [
                     {
                         "name": "schedule_task",
-                        "description": "Schedule a task to be executed at a specific time. The 'schedule' field must be a structured JSON object. See the 'schedule' property for details and examples.",
+                        "description": "Schedule a task to be executed at a specific time",
                         "endpoint": "messages",
                         "method": "POST",
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "name": {"type": "string", "description": "Name of the task."},
-                                "schedule": {
-                                    "type": "object",
-                                    "description": "Structured schedule object. Use one of the following formats:",
-                                    "oneOf": [
-                                        {
-                                            "description": "Relative schedule: run after a delay from now.",
-                                            "properties": {
-                                                "schedule_type": {"type": "string", "enum": ["relative"], "description": "Type of schedule: 'relative' for a delay from now."},
-                                                "unit": {"type": "string", "enum": ["seconds", "minutes", "hours"], "description": "Unit of time for the delay."},
-                                                "amount": {"type": "integer", "minimum": 1, "description": "Amount of time units to wait before running the task."}
-                                            },
-                                            "required": ["schedule_type", "unit", "amount"],
-                                            "examples": [
-                                                {"schedule_type": "relative", "unit": "minutes", "amount": 5}
-                                            ]
-                                        },
-                                        {
-                                            "description": "Absolute schedule: run at a specific date and time (ISO8601).",
-                                            "properties": {
-                                                "schedule_type": {"type": "string", "enum": ["absolute"], "description": "Type of schedule: 'absolute' for a specific date/time."},
-                                                "datetime": {"type": "string", "format": "date-time", "description": "ISO8601 datetime string in the future (e.g., '2025-12-25T10:00:00Z')."}
-                                            },
-                                            "required": ["schedule_type", "datetime"],
-                                            "examples": [
-                                                {"schedule_type": "absolute", "datetime": "2025-12-25T10:00:00Z"}
-                                            ]
-                                        },
-                                        {
-                                            "description": "Recurrent schedule: run periodically using a cron expression.",
-                                            "properties": {
-                                                "schedule_type": {"type": "string", "enum": ["recurrent"], "description": "Type of schedule: 'recurrent' for periodic tasks."},
-                                                "cron": {"type": "string", "description": "Cron expression (e.g., '0 9 * * 1' for every Monday at 9:00)."}
-                                            },
-                                            "required": ["schedule_type", "cron"],
-                                            "examples": [
-                                                {"schedule_type": "recurrent", "cron": "0 9 * * 1"}
-                                            ]
-                                        }
-                                    ]
-                                },
-                                "type": {"type": "string", "enum": ["shell_command", "api_call", "ai", "reminder"], "description": "Type of task to schedule."},
-                                "command": {"type": "string", "description": "Shell command to execute (for shell_command tasks)."},
-                                "api_url": {"type": "string", "description": "API URL to call (for api_call tasks)."},
-                                "api_method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "description": "HTTP method for API call."},
-                                "api_headers": {"type": "object", "description": "Headers for API call."},
-                                "api_body": {"type": "object", "description": "Body for API call."},
-                                "prompt": {"type": "string", "description": "Prompt for AI tasks."},
-                                "reminder_message": {"type": "string", "description": "Message to show for reminder tasks."},
-                                "reminder_title": {"type": "string", "description": "Title for reminder tasks."},
-                                "do_only_once": {"type": "boolean", "description": "If true, the task will only run once."},
-                                "enabled": {"type": "boolean", "description": "If false, the task will not be scheduled until enabled."}
+                                "name": {"type": "string"},
+                                "schedule": {"type": "string"},
+                                "type": {"type": "string", "enum": ["shell_command", "api_call", "ai", "reminder"]},
+                                "command": {"type": "string"},
+                                "api_url": {"type": "string"},
+                                "api_method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
+                                "api_headers": {"type": "object"},
+                                "api_body": {"type": "object"},
+                                "prompt": {"type": "string"},
+                                "reminder_message": {"type": "string"},
+                                "reminder_title": {"type": "string"},
+                                "do_only_once": {"type": "boolean"},
+                                "enabled": {"type": "boolean"}
                             },
-                            "required": ["name", "schedule", "type"],
-                            "examples": [
-                                {
-                                    "name": "Drink water",
-                                    "schedule": {"schedule_type": "relative", "unit": "minutes", "amount": 5},
-                                    "type": "reminder",
-                                    "reminder_message": "Es hora de tomar agua."
-                                },
-                                {
-                                    "name": "Doctor appointment",
-                                    "schedule": {"schedule_type": "absolute", "datetime": "2025-12-25T10:00:00Z"},
-                                    "type": "reminder",
-                                    "reminder_message": "Tienes turno con el doctor."
-                                },
-                                {
-                                    "name": "Weekly report",
-                                    "schedule": {"schedule_type": "recurrent", "cron": "0 9 * * 1"},
-                                    "type": "reminder",
-                                    "reminder_message": "Enviar reporte semanal."
-                                }
-                            ]
+                            "required": ["name", "schedule", "type"]
                         }
                     },
                     {
@@ -495,59 +431,41 @@ class McpScheduler:
         @self.app.get("/mcp/sse")
         async def sse_endpoint(
             request: Request, 
-            session_id: str = Query(None),
-            request_id: str = Query(None),
-            persistent: bool = Query(False)
+            session_id: str = Query(None, description="Session ID"),
+            request_id: str = Query(None, description="Request ID")
         ):
             # Support both session_id and request_id parameters
             if not session_id and not request_id:
                 raise HTTPException(status_code=400, detail="Session ID or Request ID is required")
+            
             # Use request_id as session_id if session_id is not provided
             if not session_id and request_id:
                 session_id = request_id
 
-            logger.info(f"SSE endpoint requested for session {session_id} (persistent={persistent})")
+            logger.info(f"SSE endpoint requested for session {session_id}")
             
             # Si ya existe una sesión, la actualizamos y la devolvemos para continuarla
             if session_id in self.sessions:
                 logger.info(f"Session {session_id} already exists. Resuming connection.")
                 self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
                 self.sessions[session_id]["status"] = "connected"
-                self.sessions[session_id]["persistent"] = persistent
             else:
                 logger.info(f"Creating new session: {session_id}")
                 self.sessions[session_id] = {
                     "queue": asyncio.Queue(),
                     "last_heartbeat": datetime.now(UTC),
                     "status": "connected",
-                    "messages": [],
-                    "persistent": persistent,
-                    "created_at": datetime.now(UTC)  # Added for session lifetime tracking
+                    "messages": []
                 }
                 # Emitir un mensaje de conexión para la nueva sesión
                 self.send_sse_message(session_id, {"type": "connected", "session_id": session_id})
                 self.send_sse_message(session_id, {"type": "endpoint", "data": "/mcp/messages"})
-
-            if persistent:
-                self.persistent_sessions.add(session_id)
-
-            # Si la sesión es persistente y se provee client_request_id, regístrala en el mapeo
-            client_request_id = request.query_params.get("client_request_id")
-            if persistent and client_request_id:
-                if client_request_id not in self.client_to_sessions:
-                    self.client_to_sessions[client_request_id] = set()
-                self.client_to_sessions[client_request_id].add(session_id)
-                logger.info(f"[SSE] Persistent session {session_id} registered for client_request_id {client_request_id}")
 
             async def event_generator():
                 last_heartbeat_sent = datetime.now(UTC)
                 try:
                     while True:
                         try:
-                            # Verificar si la sesión sigue activa
-                            if session_id not in self.sessions:
-                                logger.info(f"[SSE-TRACE] Session {session_id} no longer exists. Exiting event_generator loop.")
-                                break
                             # Enviar heartbeats cada self.config.heartbeat_interval segundos
                             now = datetime.now(UTC)
                             if (now - last_heartbeat_sent).total_seconds() > self.config.heartbeat_interval:
@@ -558,9 +476,10 @@ class McpScheduler:
 
                             # Intentar obtener un mensaje de la cola con un timeout
                             msg = await asyncio.wait_for(self.sessions[session_id]["queue"].get(), timeout=1.0) # Espera 1 segundo
-                            logger.info(f"[SSE-TRACE] Yielding message to client for session {session_id}: {msg}")
+                            
                             # Resetear el contador de inactividad de la sesión
                             self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
+                            
                             logger.debug(f"Sending message to session {session_id}: {msg}")
                             yield f"data: {json.dumps(msg)}\n\n"
                         except asyncio.TimeoutError:
@@ -568,13 +487,10 @@ class McpScheduler:
                             pass
                         except Exception as e:
                             logger.error(f"Error in event_generator for session {session_id}: {e}")
-                            # Si la sesión ya no existe, salir del bucle
-                            if session_id not in self.sessions:
-                                logger.info(f"Session {session_id} was removed after error. Exiting event_generator loop.")
-                                break
+                            # No hacer break, seguir intentando
                             await asyncio.sleep(1) # Esperar un poco antes de reintentar para evitar spam de errores
                 finally:
-                    logger.info(f"[SSE-TRACE] SSE event generator for session {session_id} finished or client disconnected. Cleaning up session.")
+                    logger.info(f"SSE event generator for session {session_id} finished or client disconnected. Cleaning up session.")
                     self.cleanup_session(session_id)
 
             return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -584,14 +500,8 @@ class McpScheduler:
             logger.info("=== ENDPOINT CALLED: /mcp/messages ===")
             try:
                 logger.info("Received POST request to /mcp/messages")
-                raw_body = await request.body()
-                logger.info(f"Raw request body: {raw_body}")
-                try:
-                    data = await request.json()
-                except Exception as e:
-                    logger.error(f"Error parsing JSON: {e}")
-                    raise HTTPException(status_code=400, detail="Invalid JSON")
-                logger.info(f"Parsed request data: {data}")
+                data = await request.json()
+                logger.info(f"Request data: {data}")
                 
                 # Manejar formato JSON-RPC
                 if "jsonrpc" in data:
@@ -637,22 +547,6 @@ class McpScheduler:
                 logger.error(f"Error processing message: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
 
-        @self.app.get("/debug/sessions")
-        async def debug_sessions():
-            # Devuelve el estado actual de todas las sesiones (para debugging/testing)
-            return {
-                "sessions": {
-                    sid: {
-                        "status": s["status"],
-                        "persistent": s.get("persistent", False),
-                        "last_heartbeat": s["last_heartbeat"].isoformat() if s.get("last_heartbeat") else None,
-                        "created_at": s.get("created_at").isoformat() if s.get("created_at") else None,
-                        "messages_in_queue": s["queue"].qsize() if "queue" in s else 0
-                    }
-                    for sid, s in self.sessions.items()
-                }
-            }
-
     async def process_tool_request(self, session_id: str, tool: str, args: Dict[str, Any], client_request_id: Optional[str] = None):
         logger.info(f"=== BACKGROUND TASK STARTED: process_tool_request({session_id}, {tool}) ===")
         try:
@@ -681,7 +575,7 @@ class McpScheduler:
                     prompt=args.get("prompt"),
                     reminder_message=args.get("reminder_message"),
                     reminder_title=args.get("reminder_title"),
-                    do_only_once=True,  # Los reminders deben ejecutarse solo una vez
+                    do_only_once=(args.get("do_only_once", True) if TaskType(args["type"]) != TaskType.REMINDER else False), # Ensure reminders are not do_only_once
                     client_request_id=client_request_id # Pass client_request_id to Task
                 )
                 logger.info(f"Creating task with args: {args}")
@@ -710,21 +604,6 @@ class McpScheduler:
                 }
                 self.send_sse_message(session_id, result_message) # Send to specific session_id
                 logger.info(f"Sent result message: {result_message}")
-
-                # Guardar el mapeo client_request_id -> set de session_ids
-                if client_request_id:
-                    # Inicializar el set si no existe
-                    if client_request_id not in self.client_to_sessions:
-                        self.client_to_sessions[client_request_id] = set()
-                    # Si la sesión es persistente, asegúrate de que esté en el set y priorízala
-                    if session_info.get("persistent"):
-                        self.client_to_sessions[client_request_id].add(session_id)
-                    else:
-                        # Solo agrega sesiones temporales si no hay ninguna persistente
-                        persistent_sessions = [sid for sid in self.client_to_sessions[client_request_id] if self.sessions.get(sid, {}).get("persistent")]
-                        if not persistent_sessions:
-                            self.client_to_sessions[client_request_id].add(session_id)
-                        # Si ya hay una persistente, no agregues la temporal
 
             elif tool == "list_tasks":
                 try:
@@ -867,37 +746,21 @@ class McpScheduler:
         if task.type == TaskType.REMINDER and execution.status == TaskStatus.COMPLETED:
             reminder_message = {
                 "type": "reminder",
-                "task_id": task.id,
-                "task_name": task.name,
-                "message": task.reminder_message,
-                "executed_at": execution.end_time.isoformat() if execution.end_time else None,
+                "reminder": {
+                    "task_id": task.id,
+                    "task_name": task.name,
+                    "message": task.reminder_message,
+                    "executed_at": execution.end_time.isoformat() if execution.end_time else None
+                },
                 "timestamp": datetime.now(UTC).isoformat(),
                 "client_request_id": task.client_request_id
             }
-            # Log de todas las sesiones activas y persistentes
-            active_persistent_sessions = [sid for sid, sess in self.sessions.items() if sess.get("persistent") and sess.get("status") == "connected"]
-            logger.info(f"[on_task_executed] Sesiones activas y persistentes: {active_persistent_sessions}")
-            logger.info(f"[on_task_executed] Estado de todas las sesiones al ejecutar recordatorio: {{sid: {{'status': sess.get('status'), 'persistent': sess.get('persistent'), 'created_at': str(sess.get('created_at')), 'last_heartbeat': str(sess.get('last_heartbeat'))}} for sid, sess in self.sessions.items()}}")
-            # Buscar sesiones persistentes primero
-            session_ids = self.client_to_sessions.get(task.client_request_id, set())
-            logger.info(f"[on_task_executed] client_to_sessions for {task.client_request_id}: {session_ids}")
-            persistent = [sid for sid in session_ids if self.sessions.get(sid, {}).get("persistent") and self.sessions.get(sid, {}).get("status") == "connected"]
-            logger.info(f"[on_task_executed] persistent target_sessions: {persistent}")
-            target_sessions = persistent if persistent else [sid for sid in session_ids if self.sessions.get(sid, {}).get("status") == "connected"]
-            logger.info(f"[on_task_executed] final target_sessions: {target_sessions}")
-            if target_sessions:
-                for sid in target_sessions:
-                    logger.info(f"[on_task_executed] Sending reminder to session {sid}")
-                    self.send_sse_message(sid, reminder_message)
+            logger.info(f"[on_task_executed] Emitting SSE reminder message at {datetime.now(UTC).isoformat()}: {reminder_message}")
+            if task.client_request_id:
+                self.send_sse_message(task.client_request_id, reminder_message)
             else:
-                # Enviar a todas las sesiones activas y persistentes (igual que heartbeat)
-                global_sessions = active_persistent_sessions
-                if global_sessions:
-                    logger.info(f"[on_task_executed] No session for client_request_id {task.client_request_id}. Sending reminder to all persistent sessions: {global_sessions}")
-                    for sid in global_sessions:
-                        self.send_sse_message(sid, reminder_message)
-                else:
-                    logger.warning(f"[on_task_executed] No active session found for client_request_id {task.client_request_id} nor any persistent session. Not sending reminder via SSE.")
+                logger.warning(f"[on_task_executed] No client_request_id found for reminder task {task.id}. Not sending reminder via SSE.")
+
         # TODO: This should ideally only be sent if the original request expects a final result.
         # Currently, it's broadcasting, which might not be desired.
         result_message = {
@@ -913,49 +776,22 @@ class McpScheduler:
             "timestamp": datetime.now(UTC).isoformat(),
             "client_request_id": task.client_request_id
         }
-        session_ids = self.client_to_sessions.get(task.client_request_id, set())
-        # Limpiar sesiones inactivas del set antes de enviar
-        session_ids = set([sid for sid in session_ids if self.sessions.get(sid, {}).get("status") == "connected"])
-        self.client_to_sessions[task.client_request_id] = session_ids
-        persistent = [sid for sid in session_ids if self.sessions.get(sid, {}).get("persistent")]
-        target_sessions = persistent if persistent else list(session_ids)
-        if target_sessions:
-            for sid in target_sessions:
-                self.send_sse_message(sid, result_message)
+        logger.info(f"[on_task_executed] Emitting SSE result message at {datetime.now(UTC).isoformat()}: {result_message}")
+        if task.client_request_id:
+            self.send_sse_message(task.client_request_id, result_message)
         else:
-            logger.warning(f"[on_task_executed] No active session found for client_request_id {task.client_request_id}. Not sending result via SSE.")
-
-    def _make_json_serializable(self, obj):
-        # Convierte objetos Task, Execution, datetime, etc. a tipos serializables
-        import datetime
-        from .task import Task, TaskExecution
-        if isinstance(obj, dict):
-            return {k: self._make_json_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._make_json_serializable(v) for v in obj]
-        elif hasattr(obj, 'dict') and callable(getattr(obj, 'dict', None)):
-            return self._make_json_serializable(obj.dict())
-        elif hasattr(obj, '__dict__'):
-            return self._make_json_serializable(vars(obj))
-        elif isinstance(obj, datetime.datetime):
-            return obj.isoformat()
-        elif isinstance(obj, (str, int, float, bool)) or obj is None:
-            return obj
-        else:
-            return str(obj)
+            logger.warning(f"[on_task_executed] No client_request_id found for result task {task.id}. Not sending result via SSE.")
 
     def send_sse_message(self, session_id: str, message: Dict[str, Any]):
         session = self.sessions.get(session_id)
         if session and session["status"] == "connected":
             try:
-                serializable_message = self._make_json_serializable(message)
-                logger.info(f"[SSE-TRACE] Putting message to queue for session {session_id}: {serializable_message}")
-                session["queue"].put_nowait(serializable_message)
-                logger.info(f"Message put to queue for session {session_id}: {serializable_message}")
+                session["queue"].put_nowait(message)
+                logger.info(f"Message put to queue for session {session_id}: {message}")
             except asyncio.QueueFull: # Si la cola está llena, el cliente no está leyendo lo suficientemente rápido
                 logger.warning(f"SSE queue full for session {session_id}. Dropping message: {message}")
             except Exception as e:
-                logger.error(f"Error putting message to SSE queue for session {session_id}: {e}. Message: {message}")
+                logger.error(f"Error putting message to queue for session {session_id}: {e}")
         else:
             logger.warning(f"Session {session_id} not active. Not sending message: {message}")
 
@@ -972,20 +808,6 @@ class McpScheduler:
             port=port,
             log_level=self.config.log_level.lower()
         )
-
-    def cleanup_session(self, session_id: str):
-        """Remove a session and notify others."""
-        if session_id in self.sessions:
-            logger.info(f"Cleaning up session: {session_id}")
-            now = datetime.now(UTC)
-            self.broadcast_message({
-                "type": "session_disconnected",
-                "session_id": session_id,
-                "timestamp": now.isoformat()
-            }, exclude={session_id})
-            del self.sessions[session_id]
-        else:
-            logger.info(f"Session {session_id} already cleaned up or does not exist.")
 
 if __name__ == "__main__":
     scheduler = McpScheduler()
