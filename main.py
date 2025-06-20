@@ -178,6 +178,12 @@ def main():
     # Enable debug mode
     debug_mode = args.debug
     
+    # Configure logging early
+    config = Config() # Load config to get log level and file
+    setup_logging(config.log_level, config.log_file)
+    logger = logging.getLogger(__name__)
+    logger.info(f"Using database path: {config.db_path}")
+
     # Register signal handlers
     signal.signal(signal.SIGTERM, handle_sigterm)
     
@@ -192,43 +198,26 @@ def main():
                     log_to_stderr("Installing basic JSON fix wrapper")
                     sys.stdin = SafeJsonStdin(sys.stdin)
                     
-        # Load configuration
-        config = Config()
-        
-        # Show version and exit if requested
-        if args.version:
-            log_to_stderr(f"{config.server_name} version {config.server_version}")
-            sys.exit(0)
-        
-        # Configure logging - ensure it goes to a file or stderr, not stdout
-        if not config.log_file and config.transport == "stdio":
-            # Force a log file when using stdio transport if none was specified
-            config.log_file = "mcp_scheduler.log"
-            
-        setup_logging(config.log_level, config.log_file)
-        
         # Initialize components
+        logger.info(f"Initializing Database with path: {config.db_path}")
         database = Database(config.db_path)
-        executor = Executor(None, config.ai_model)
-        scheduler = Scheduler(database, executor)
-        
-        # Asegurarse de que el path base sea correcto
-        if not config.base_path:
-            config.base_path = "/mcp"
-        
-        server = McpScheduler()
-        server.run()
+        logger.info("Database initialized successfully.")
 
-    except KeyboardInterrupt:
-        log_to_stderr("Interrupted by user")
-        shutdown_event.set()
-        if scheduler_thread and scheduler_thread.is_alive():
-            scheduler_thread.join(timeout=5)
-        sys.exit(0)
+        logger.info("Initializing Executor...")
+        executor = Executor(config)
+        logger.info("Executor initialized successfully.")
+        
+        logger.info("Initializing McpScheduler...")
+        server = McpScheduler(database, executor) # This will initialize Database and Scheduler
+        logger.info("McpScheduler initialized successfully.")
+
+        # Run the server
+        logger.info(f"Starting server on {config.server_address}:{config.server_port}")
+        server.run(host=config.server_address, port=config.server_port)
     except Exception as e:
-        log_to_stderr(f"Error during initialization: {e}")
+        logger.critical(f"Fatal error during startup: {e}")
         if debug_mode:
-            traceback.print_exc(file=sys.stderr)
+            traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":

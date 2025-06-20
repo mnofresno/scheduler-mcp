@@ -184,6 +184,18 @@ class Scheduler:
             if task.id in self._running_tasks:
                 del self._running_tasks[task.id]
     
+    async def get_next_run_time(self, task: Task) -> Optional[datetime]:
+        """Calculate the next run time for a given task."""
+        if not task.schedule:
+            return None
+        try:
+            now = datetime.now(UTC)
+            cron = croniter.croniter(task.schedule, now)
+            return cron.get_next(datetime)
+        except Exception as e:
+            logger.error(f"Invalid cron expression for task {task.id}: {e}")
+            return None
+
     async def add_task(self, task: Task) -> Task:
         """Add a new task to the scheduler."""
         logger.info(f"=== ADD_TASK CALLED: schedule='{task.schedule}' ===")

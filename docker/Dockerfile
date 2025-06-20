@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.4
 FROM --platform=$BUILDPLATFORM python:3.11-slim
 
 # Set environment variables
@@ -15,6 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Install adduser for user creation (Debian/Ubuntu based)
 RUN apt-get update && apt-get install -y --no-install-recommends adduser \
     && adduser --disabled-password --gecos "" --uid 1000 mcp \
+    && mkdir -p /data && chown -R mcp:mcp /data \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

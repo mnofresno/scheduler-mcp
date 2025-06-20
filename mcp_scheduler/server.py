@@ -20,7 +20,7 @@ from .executor import Executor
 logger = logging.getLogger(__name__)
 
 class McpScheduler:
-    def __init__(self):
+    def __init__(self, database: Database, executor: Executor):
         self.config = Config()
         self.app = FastAPI(
             title=self.config.server_name,
@@ -28,8 +28,8 @@ class McpScheduler:
         )
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self.pending_ai_tasks: Dict[str, Dict[str, Any]] = {}  # task_id -> task_info
-        self.database = Database(self.config.db_path)
-        self.executor = Executor(self.config)
+        self.database = database
+        self.executor = executor
         self.scheduler = Scheduler(self.database, self.executor, on_task_executed=self.on_task_executed)
         self.setup_middleware()
         self.setup_routes()
@@ -442,58 +442,58 @@ class McpScheduler:
             if not session_id and request_id:
                 session_id = request_id
 
-            async def event_generator():
-                try:
-                    self.sessions[session_id] = {
-                        "created_at": datetime.now(UTC),
-                        "messages": [],
-                        "status": "connected",
-                        "last_heartbeat": datetime.now(UTC)
-                    }
-                    
-                    # Notificar a otros clientes sobre la nueva conexión
-                    self.broadcast_message({
-                        "type": "session_connected",
-                        "session_id": session_id,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    }, exclude={session_id})
-                    
-                    yield f"data: {json.dumps({'type': 'connected', 'session_id': session_id})}\n\n"
-                    yield f"data: {json.dumps({'type': 'endpoint', 'data': '/mcp/messages'})}\n\n"
-                    
-                    while True:
-                        session = self.sessions.get(session_id)
-                        if not session or session["status"] != "connected":
-                            logger.info(f"Session {session_id} disconnected")
-                            break
-
-                        while session["messages"]:
-                            message = session["messages"].pop(0)
-                            yield f"data: {json.dumps(message)}\n\n"
-
-                        yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.now(UTC).isoformat()})}\n\n"
-                        session["last_heartbeat"] = datetime.now(UTC)
-                        await asyncio.sleep(self.config.heartbeat_interval)
-                        
-                except Exception as e:
-                    logger.error(f"Error in SSE connection: {str(e)}")
-                    if session_id in self.sessions:
-                        self.sessions[session_id]["status"] = "disconnected"
-                    raise
-                finally:
-                    if session_id in self.sessions:
-                        self.sessions[session_id]["status"] = "disconnected"
-                        logger.info(f"Session {session_id} cleaned up")
-
-            return StreamingResponse(
-                event_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"
+            logger.info(f"SSE endpoint requested for session {session_id}")
+            
+            # Si ya existe una sesión, la actualizamos y la devolvemos para continuarla
+            if session_id in self.sessions:
+                logger.info(f"Session {session_id} already exists. Resuming connection.")
+                self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
+                self.sessions[session_id]["status"] = "connected"
+            else:
+                logger.info(f"Creating new session: {session_id}")
+                self.sessions[session_id] = {
+                    "queue": asyncio.Queue(),
+                    "last_heartbeat": datetime.now(UTC),
+                    "status": "connected",
+                    "messages": []
                 }
-            )
+                # Emitir un mensaje de conexión para la nueva sesión
+                self.send_sse_message(session_id, {"type": "connected", "session_id": session_id})
+                self.send_sse_message(session_id, {"type": "endpoint", "data": "/mcp/messages"})
+
+            async def event_generator():
+                last_heartbeat_sent = datetime.now(UTC)
+                try:
+                    while True:
+                        try:
+                            # Enviar heartbeats cada self.config.heartbeat_interval segundos
+                            now = datetime.now(UTC)
+                            if (now - last_heartbeat_sent).total_seconds() > self.config.heartbeat_interval:
+                                heartbeat_message = {"type": "heartbeat", "timestamp": now.isoformat()}
+                                logger.debug(f"Sending heartbeat for session {session_id}")
+                                yield f"data: {json.dumps(heartbeat_message)}\n\n"
+                                last_heartbeat_sent = now
+
+                            # Intentar obtener un mensaje de la cola con un timeout
+                            msg = await asyncio.wait_for(self.sessions[session_id]["queue"].get(), timeout=1.0) # Espera 1 segundo
+                            
+                            # Resetear el contador de inactividad de la sesión
+                            self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
+                            
+                            logger.debug(f"Sending message to session {session_id}: {msg}")
+                            yield f"data: {json.dumps(msg)}\n\n"
+                        except asyncio.TimeoutError:
+                            # No hay mensajes, continuar con el bucle para el heartbeat
+                            pass
+                        except Exception as e:
+                            logger.error(f"Error in event_generator for session {session_id}: {e}")
+                            # No hacer break, seguir intentando
+                            await asyncio.sleep(1) # Esperar un poco antes de reintentar para evitar spam de errores
+                finally:
+                    logger.info(f"SSE event generator for session {session_id} finished or client disconnected. Cleaning up session.")
+                    self.cleanup_session(session_id)
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
 
         @self.app.post("/mcp/messages")
         async def process_message(request: Request, background_tasks: BackgroundTasks):
@@ -508,10 +508,12 @@ class McpScheduler:
                     session_id = data.get("id")
                     tool = data.get("method")
                     args = data.get("params", {})
+                    client_request_id = data.get("client_request_id")
                 else:
                     session_id = data.get("session_id")
                     tool = data.get("tool")
                     args = data.get("args", {})
+                    client_request_id = data.get("client_request_id")
 
                 logger.info(f"Extracted: session_id={session_id}, tool={tool}, args={args}")
 
@@ -524,14 +526,14 @@ class McpScheduler:
                     raise HTTPException(status_code=404, detail="Session not found")
 
                 session = self.sessions[session_id]
-                logger.info(f"Session {session_id} found, status: {session['status']}")
+                logger.info("Session found: {}, status: {}".format(session_id, session["status"]))
                 
                 if session["status"] != "connected":
                     logger.error(f"Session {session_id} is not active, status: {session['status']}")
                     raise HTTPException(status_code=400, detail="Session is not active")
 
                 logger.info(f"Adding background task: process_tool_request({session_id}, {tool}, {args})")
-                background_tasks.add_task(self.process_tool_request, session_id, tool, args)
+                background_tasks.add_task(self.process_tool_request, session_id, tool, args, client_request_id)
                 logger.info("Background task added successfully")
                 
                 # Agregar un log de confirmación inmediato
@@ -545,69 +547,63 @@ class McpScheduler:
                 logger.error(f"Error processing message: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
 
-    async def process_tool_request(self, session_id: str, tool: str, args: Dict[str, Any]):
+    async def process_tool_request(self, session_id: str, tool: str, args: Dict[str, Any], client_request_id: Optional[str] = None):
         logger.info(f"=== BACKGROUND TASK STARTED: process_tool_request({session_id}, {tool}) ===")
         try:
             logger.info(f"Processing tool request: session_id={session_id}, tool={tool}, args={args}")
-            session = self.sessions.get(session_id)
-            if not session:
-                logger.warning(f"Session {session_id} not found during tool processing")
+
+            session_info = self.sessions.get(session_id)
+            if not session_info or session_info["status"] != "connected":
+                logger.error(f"Session not found or not connected: {session_id}")
+                self.send_sse_message(session_id, {"type": "error", "error": "Session not connected"})
                 return
 
-            logger.info(f"Session found: {session_id}, status: {session['status']}")
+            logger.info(f"Session found: {session_id}, status: {session_info['status']}")
 
+            # Aquí se manejan los diferentes tipos de herramientas
             if tool == "schedule_task":
-                try:
-                    logger.info(f"Creating task with args: {args}")
-                    task = Task(
-                        name=args["name"],
-                        schedule=args["schedule"],
-                        type=TaskType(args["type"]),
-                        command=args.get("command"),
-                        api_url=args.get("api_url"),
-                        api_method=args.get("api_method"),
-                        api_headers=args.get("api_headers"),
-                        api_body=args.get("api_body"),
-                        prompt=args.get("prompt"),
-                        reminder_message=args.get("reminder_message"),
-                        reminder_title=args.get("reminder_title"),
-                        do_only_once=args.get("do_only_once", True),
-                        enabled=args.get("enabled", True)
-                    )
+                # Create a new task
+                task = Task(
+                    name=args["name"],
+                    schedule=args["schedule"],
+                    type=TaskType(args["type"]),
+                    command=args.get("command"),
+                    api_url=args.get("api_url"),
+                    api_method=args.get("api_method"),
+                    api_headers=args.get("api_headers"),
+                    api_body=args.get("api_body"),
+                    prompt=args.get("prompt"),
+                    reminder_message=args.get("reminder_message"),
+                    reminder_title=args.get("reminder_title"),
+                    do_only_once=(args.get("do_only_once", True) if TaskType(args["type"]) != TaskType.REMINDER else False), # Ensure reminders are not do_only_once
+                    client_request_id=client_request_id # Pass client_request_id to Task
+                )
+                logger.info(f"Creating task with args: {args}")
 
-                    logger.info(f"Adding task to scheduler: {task.name}")
-                    task = await self.scheduler.add_task(task)
-                    logger.info(f"Task added successfully: {task.id}")
-                    
-                    response_message = {
-                        "type": "result",
-                        "result": {
-                            "task_id": task.id,
-                            "task_name": task.name,
-                            "schedule": task.schedule,
-                            "type": task.type.value,
-                            "status": task.status.value,
-                            "next_run": task.next_run.isoformat() if task.next_run else None,
-                            "message": f"Recordatorio '{task.name}' programado exitosamente para {task.next_run.strftime('%Y-%m-%d %H:%M:%S') if task.next_run else 'tiempo indefinido'}"
-                        },
-                        "timestamp": datetime.now(UTC).isoformat()
-                    }
-                    
-                    logger.info(f"Broadcasting result message: {response_message}")
-                    self.broadcast_message(response_message)
-                    
-                    # También agregar el mensaje a la sesión específica
-                    logger.info(f"Adding result message to session {session_id}")
-                    session["messages"].append(response_message)
-                    
-                except ValueError as e:
-                    error_message = {
-                        "type": "error",
-                        "error": f"Invalid task parameters: {str(e)}",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    }
-                    logger.error(f"Task creation failed: {str(e)}")
-                    session["messages"].append(error_message)
+                task_id = await self.scheduler.add_task(task)
+
+                # Determine next run time for display purposes in result message
+                next_run_time = await self.scheduler.get_next_run_time(task)
+
+                message_content = f"Recordatorio '{task.name}' programado exitosamente para {next_run_time.strftime('%Y-%m-%d %H:%M:%S')}" 
+
+                # Send result message
+                result_message = {
+                    "type": "result",
+                    "result": {
+                        "task_id": task_id, 
+                        "task_name": task.name,
+                        "schedule": task.schedule,
+                        "type": task.type.value,
+                        "status": "pending",
+                        "next_run": next_run_time.isoformat(), 
+                        "message": message_content
+                    },
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "client_request_id": client_request_id # Include client_request_id here
+                }
+                self.send_sse_message(session_id, result_message) # Send to specific session_id
+                logger.info(f"Sent result message: {result_message}")
 
             elif tool == "list_tasks":
                 try:
@@ -622,13 +618,13 @@ class McpScheduler:
                            (type_filter == "all" or task.type.value == type_filter)
                     ]
 
-                    session["messages"].append({
+                    session_info["messages"].append({
                         "type": "task_list",
                         "tasks": filtered_tasks,
                         "timestamp": datetime.now(UTC).isoformat()
                     })
                 except Exception as e:
-                    session["messages"].append({
+                    session_info["messages"].append({
                         "type": "error",
                         "error": f"Error listing tasks: {str(e)}",
                         "timestamp": datetime.now(UTC).isoformat()
@@ -640,7 +636,7 @@ class McpScheduler:
                     task = await self.scheduler.get_task(task_id)
                     
                     if not task:
-                        session["messages"].append({
+                        session_info["messages"].append({
                             "type": "error",
                             "error": f"Task {task_id} not found",
                             "timestamp": datetime.now(UTC).isoformat()
@@ -673,13 +669,13 @@ class McpScheduler:
                                 "timestamp": datetime.now(UTC).isoformat()
                             })
                         else:
-                            session["messages"].append({
+                            session_info["messages"].append({
                                 "type": "error",
                                 "error": f"Could not run task {task_id}",
                                 "timestamp": datetime.now(UTC).isoformat()
                             })
                 except Exception as e:
-                    session["messages"].append({
+                    session_info["messages"].append({
                         "type": "error",
                         "error": f"Error running task: {str(e)}",
                         "timestamp": datetime.now(UTC).isoformat()
@@ -692,7 +688,7 @@ class McpScheduler:
                     result = args["result"]
                     
                     if task_id not in self.pending_ai_tasks:
-                        session["messages"].append({
+                        session_info["messages"].append({
                             "type": "error",
                             "error": f"No pending AI task found for ID: {task_id}",
                             "timestamp": datetime.now(UTC).isoformat()
@@ -721,14 +717,14 @@ class McpScheduler:
                         "timestamp": datetime.now(UTC).isoformat()
                     })
                 except Exception as e:
-                    session["messages"].append({
+                    session_info["messages"].append({
                         "type": "error",
                         "error": f"Error executing AI task: {str(e)}",
                         "timestamp": datetime.now(UTC).isoformat()
                     })
 
             else:
-                session["messages"].append({
+                session_info["messages"].append({
                     "type": "error",
                     "error": f"Unknown tool: {tool}",
                     "timestamp": datetime.now(UTC).isoformat()
@@ -737,8 +733,8 @@ class McpScheduler:
         except Exception as e:
             logger.error(f"Error processing tool request: {str(e)}")
             if session_id in self.sessions:
-                session = self.sessions[session_id]
-                session["messages"].append({
+                session_info = self.sessions[session_id]
+                session_info["messages"].append({
                     "type": "error",
                     "error": str(e),
                     "timestamp": datetime.now(UTC).isoformat()
@@ -756,27 +752,48 @@ class McpScheduler:
                     "message": task.reminder_message,
                     "executed_at": execution.end_time.isoformat() if execution.end_time else None
                 },
-                "timestamp": datetime.now(UTC).isoformat()
+                "timestamp": datetime.now(UTC).isoformat(),
+                "client_request_id": task.client_request_id
             }
-            logger.info(f"[on_task_executed] Emitting SSE reminder message: {reminder_message}")
-            self.broadcast_message(reminder_message)
-        # (opcional) Mantener el mensaje 'result' si lo necesitas para otros flujos
-        if task.type == TaskType.REMINDER and execution.status == TaskStatus.COMPLETED:
-            result_message = {
-                "type": "result",
-                "result": {
-                    "task_id": task.id,
-                    "task_name": task.name,
-                    "schedule": task.schedule,
-                    "type": task.type.value,
-                    "status": task.status.value,
-                    "message": task.reminder_message,
-                    "executed_at": execution.end_time.isoformat() if execution.end_time else None
-                },
-                "timestamp": datetime.now(UTC).isoformat()
-            }
-            logger.info(f"[on_task_executed] Emitting SSE result message: {result_message}")
-            self.broadcast_message(result_message)
+            logger.info(f"[on_task_executed] Emitting SSE reminder message at {datetime.now(UTC).isoformat()}: {reminder_message}")
+            if task.client_request_id:
+                self.send_sse_message(task.client_request_id, reminder_message)
+            else:
+                logger.warning(f"[on_task_executed] No client_request_id found for reminder task {task.id}. Not sending reminder via SSE.")
+
+        # TODO: This should ideally only be sent if the original request expects a final result.
+        # Currently, it's broadcasting, which might not be desired.
+        result_message = {
+            "type": "result",
+            "result": {
+                "task_id": task.id,
+                "task_name": task.name,
+                "status": execution.status.value,
+                "output": execution.output,
+                "type": task.type.value,
+                "executed_at": execution.end_time.isoformat() if execution.end_time else None
+            },
+            "timestamp": datetime.now(UTC).isoformat(),
+            "client_request_id": task.client_request_id
+        }
+        logger.info(f"[on_task_executed] Emitting SSE result message at {datetime.now(UTC).isoformat()}: {result_message}")
+        if task.client_request_id:
+            self.send_sse_message(task.client_request_id, result_message)
+        else:
+            logger.warning(f"[on_task_executed] No client_request_id found for result task {task.id}. Not sending result via SSE.")
+
+    def send_sse_message(self, session_id: str, message: Dict[str, Any]):
+        session = self.sessions.get(session_id)
+        if session and session["status"] == "connected":
+            try:
+                session["queue"].put_nowait(message)
+                logger.info(f"Message put to queue for session {session_id}: {message}")
+            except asyncio.QueueFull: # Si la cola está llena, el cliente no está leyendo lo suficientemente rápido
+                logger.warning(f"SSE queue full for session {session_id}. Dropping message: {message}")
+            except Exception as e:
+                logger.error(f"Error putting message to queue for session {session_id}: {e}")
+        else:
+            logger.warning(f"Session {session_id} not active. Not sending message: {message}")
 
     def run(self, host: str = None, port: int = None):
         host = host or self.config.server_address

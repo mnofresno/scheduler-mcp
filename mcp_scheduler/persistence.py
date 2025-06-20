@@ -6,6 +6,7 @@ import sqlite3
 import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+import os
 
 from .task import Task, TaskExecution, TaskStatus, TaskType
 
@@ -22,15 +23,26 @@ class Database:
     
     def _create_tables(self):
         """Create the necessary tables if they don't exist."""
+        logger.info(f"Attempting to create database tables at {self.db_path}")
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+        # Connect to the database. If it doesn't exist, it will be created.
         with sqlite3.connect(self.db_path) as conn:
+            logger.debug("Database connection opened.")
             # Check if we need to add reminder columns
             try:
+                logger.debug("Executing: SELECT reminder_title, reminder_message FROM tasks LIMIT 1")
                 cursor = conn.execute("SELECT reminder_title, reminder_message FROM tasks LIMIT 1")
                 has_reminder_columns = True
-            except sqlite3.OperationalError:
+                logger.info("Tasks table already has reminder columns.")
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Error checking for reminder columns: {e}")
                 has_reminder_columns = False
+                logger.info("Tasks table does not have reminder columns yet, or tasks table does not exist.")
             
             # Create tasks table if it doesn't exist
+            logger.debug("Executing CREATE TABLE IF NOT EXISTS tasks...")
             conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -53,16 +65,20 @@ class Database:
                 updated_at TEXT NOT NULL
             )
             """)
+            logger.info("Attempted to create tasks table.")
             
             # Add reminder columns if they don't exist
             if not has_reminder_columns:
                 try:
+                    logger.debug("Executing ALTER TABLE tasks ADD COLUMN reminder_title...")
                     conn.execute("ALTER TABLE tasks ADD COLUMN reminder_title TEXT")
+                    logger.debug("Executing ALTER TABLE tasks ADD COLUMN reminder_message...")
                     conn.execute("ALTER TABLE tasks ADD COLUMN reminder_message TEXT")
                     logger.info("Added reminder columns to tasks table")
                 except sqlite3.OperationalError as e:
-                    logger.error(f"Error adding reminder columns: {e}")
+                    logger.warning(f"Reminder columns already exist or error adding them: {e}")
             
+            logger.debug("Executing CREATE TABLE IF NOT EXISTS executions...")
             conn.execute("""
             CREATE TABLE IF NOT EXISTS executions (
                 id TEXT PRIMARY KEY,
@@ -75,8 +91,11 @@ class Database:
                 FOREIGN KEY (task_id) REFERENCES tasks (id)
             )
             """)
+            logger.info("Attempted to create executions table.")
             
             conn.commit()
+            logger.info("Database table creation committed.")
+        logger.debug("Database connection closed.")
     
     def save_task(self, task: Task) -> None:
         """Save a task to the database."""

@@ -4,7 +4,7 @@ Utility functions for MCP Scheduler.
 import logging
 import sys
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import re
 
 
@@ -145,13 +145,12 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
             time_diff = target_time - now
             
             if time_diff.total_seconds() <= 0:
-                # If the time has already passed, schedule for next occurrence
-                # For now, just schedule for 1 minute from now
+                # If the time has already passed, schedule for 1 minute from now
                 target_time = now + timedelta(minutes=1)
             
-            # PATCH: Generar cron solo para minuto y hora, sin fijar día/mes, para ejecución inmediata
-            cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-            logger.info(f"Generated cron expression (immediate, 5 cols): '{cron_expr}'")
+            # Generate cron expression including day and month for precision
+            cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
+            logger.info(f"Generated cron expression (from ISO, specific day/month): '{cron_expr}'")
             return cron_expr
     except Exception as e:
         logger.info(f"Not an ISO timestamp: {e}")
@@ -195,13 +194,16 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
             else:
                 raise ValueError(f"Unsupported time unit: {unit}")
 
-            # Si el target_time es hoy, solo usar minuto y hora, y comodines para día/mes
-            if target_time.date() == now.date():
-                cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-            else:
-                # Si es otro día, usar día y mes
+            # Si el target_time es hoy o mañana temprano, incluir día y mes para precisión
+            now_recheck = datetime.now(UTC) # Recheck now for most accurate comparison
+            if target_time.date() == now_recheck.date() or (target_time.date() == (now_recheck + timedelta(days=1)).date() and target_time.hour < now_recheck.hour + 2):
                 cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
-            logger.info(f"Generated cron expression (smart): '{cron_expr}'")
+                logger.info(f"Generated cron expression (specific day/month): '{cron_expr}'")
+            else:
+                # Para duraciones más largas, mantener el cron más general
+                cron_expr = f"{target_time.minute} {target_time.hour} * * *"
+                logger.info(f"Generated cron expression (general): '{cron_expr}'")
+
             return cron_expr
     
     # If no pattern matches, assume it's already a cron expression
