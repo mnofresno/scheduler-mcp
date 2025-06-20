@@ -466,6 +466,10 @@ class McpScheduler:
                 try:
                     while True:
                         try:
+                            # Verificar si la sesión sigue activa
+                            if session_id not in self.sessions:
+                                logger.info(f"[SSE-TRACE] Session {session_id} no longer exists. Exiting event_generator loop.")
+                                break
                             # Enviar heartbeats cada self.config.heartbeat_interval segundos
                             now = datetime.now(UTC)
                             if (now - last_heartbeat_sent).total_seconds() > self.config.heartbeat_interval:
@@ -476,10 +480,9 @@ class McpScheduler:
 
                             # Intentar obtener un mensaje de la cola con un timeout
                             msg = await asyncio.wait_for(self.sessions[session_id]["queue"].get(), timeout=1.0) # Espera 1 segundo
-                            
+                            logger.info(f"[SSE-TRACE] Yielding message to client for session {session_id}: {msg}")
                             # Resetear el contador de inactividad de la sesión
                             self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
-                            
                             logger.debug(f"Sending message to session {session_id}: {msg}")
                             yield f"data: {json.dumps(msg)}\n\n"
                         except asyncio.TimeoutError:
@@ -487,10 +490,13 @@ class McpScheduler:
                             pass
                         except Exception as e:
                             logger.error(f"Error in event_generator for session {session_id}: {e}")
-                            # No hacer break, seguir intentando
+                            # Si la sesión ya no existe, salir del bucle
+                            if session_id not in self.sessions:
+                                logger.info(f"Session {session_id} was removed after error. Exiting event_generator loop.")
+                                break
                             await asyncio.sleep(1) # Esperar un poco antes de reintentar para evitar spam de errores
                 finally:
-                    logger.info(f"SSE event generator for session {session_id} finished or client disconnected. Cleaning up session.")
+                    logger.info(f"[SSE-TRACE] SSE event generator for session {session_id} finished or client disconnected. Cleaning up session.")
                     self.cleanup_session(session_id)
 
             return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -782,16 +788,37 @@ class McpScheduler:
         else:
             logger.warning(f"[on_task_executed] No client_request_id found for result task {task.id}. Not sending result via SSE.")
 
+    def _make_json_serializable(self, obj):
+        # Convierte objetos Task, Execution, datetime, etc. a tipos serializables
+        import datetime
+        from .task import Task, TaskExecution
+        if isinstance(obj, dict):
+            return {k: self._make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_json_serializable(v) for v in obj]
+        elif hasattr(obj, 'dict') and callable(getattr(obj, 'dict', None)):
+            return self._make_json_serializable(obj.dict())
+        elif hasattr(obj, '__dict__'):
+            return self._make_json_serializable(vars(obj))
+        elif isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        else:
+            return str(obj)
+
     def send_sse_message(self, session_id: str, message: Dict[str, Any]):
         session = self.sessions.get(session_id)
         if session and session["status"] == "connected":
             try:
-                session["queue"].put_nowait(message)
-                logger.info(f"Message put to queue for session {session_id}: {message}")
+                serializable_message = self._make_json_serializable(message)
+                logger.info(f"[SSE-TRACE] Putting message to queue for session {session_id}: {serializable_message}")
+                session["queue"].put_nowait(serializable_message)
+                logger.info(f"Message put to queue for session {session_id}: {serializable_message}")
             except asyncio.QueueFull: # Si la cola está llena, el cliente no está leyendo lo suficientemente rápido
                 logger.warning(f"SSE queue full for session {session_id}. Dropping message: {message}")
             except Exception as e:
-                logger.error(f"Error putting message to queue for session {session_id}: {e}")
+                logger.error(f"Error putting message to SSE queue for session {session_id}: {e}. Message: {message}")
         else:
             logger.warning(f"Session {session_id} not active. Not sending message: {message}")
 
@@ -808,6 +835,20 @@ class McpScheduler:
             port=port,
             log_level=self.config.log_level.lower()
         )
+
+    def cleanup_session(self, session_id: str):
+        """Remove a session and notify others."""
+        if session_id in self.sessions:
+            logger.info(f"Cleaning up session: {session_id}")
+            now = datetime.now(UTC)
+            self.broadcast_message({
+                "type": "session_disconnected",
+                "session_id": session_id,
+                "timestamp": now.isoformat()
+            }, exclude={session_id})
+            del self.sessions[session_id]
+        else:
+            logger.info(f"Session {session_id} already cleaned up or does not exist.")
 
 if __name__ == "__main__":
     scheduler = McpScheduler()

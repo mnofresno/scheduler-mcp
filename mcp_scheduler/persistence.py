@@ -7,8 +7,10 @@ import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import os
+import sys
 
 from .task import Task, TaskExecution, TaskStatus, TaskType
+from .dbcreator import ensure_db
 
 logger = logging.getLogger(__name__)
 
@@ -19,27 +21,31 @@ class Database:
     def __init__(self, db_path="scheduler.db"):
         """Initialize the database connection."""
         self.db_path = db_path
+        ensure_db()  # Ensure DB and tables exist before anything else
         self._create_tables()
     
     def _create_tables(self):
         """Create the necessary tables if they don't exist."""
         logger.info(f"Attempting to create database tables at {self.db_path}")
         # Ensure the directory exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         # Connect to the database. If it doesn't exist, it will be created.
         with sqlite3.connect(self.db_path) as conn:
             logger.debug("Database connection opened.")
             # Check if we need to add reminder columns
             try:
-                logger.debug("Executing: SELECT reminder_title, reminder_message FROM tasks LIMIT 1")
-                cursor = conn.execute("SELECT reminder_title, reminder_message FROM tasks LIMIT 1")
+                logger.debug("Executing: SELECT reminder_title, reminder_message, client_request_id FROM tasks LIMIT 1")
+                cursor = conn.execute("SELECT reminder_title, reminder_message, client_request_id FROM tasks LIMIT 1")
                 has_reminder_columns = True
-                logger.info("Tasks table already has reminder columns.")
+                has_client_request_id = True
+                logger.info("Tasks table already has reminder columns and client_request_id.")
             except sqlite3.OperationalError as e:
-                logger.warning(f"Error checking for reminder columns: {e}")
+                logger.warning(f"Error checking for reminder/client_request_id columns: {e}")
                 has_reminder_columns = False
-                logger.info("Tasks table does not have reminder columns yet, or tasks table does not exist.")
+                has_client_request_id = False
+                logger.info("Tasks table does not have reminder columns or client_request_id yet, or tasks table does not exist.")
             
             # Create tasks table if it doesn't exist
             logger.debug("Executing CREATE TABLE IF NOT EXISTS tasks...")
@@ -62,7 +68,10 @@ class Database:
                 next_run TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                reminder_title TEXT,
+                reminder_message TEXT,
+                client_request_id TEXT
             )
             """)
             logger.info("Attempted to create tasks table.")
@@ -77,6 +86,14 @@ class Database:
                     logger.info("Added reminder columns to tasks table")
                 except sqlite3.OperationalError as e:
                     logger.warning(f"Reminder columns already exist or error adding them: {e}")
+            # Add client_request_id column if it doesn't exist
+            if not has_client_request_id:
+                try:
+                    logger.debug("Executing ALTER TABLE tasks ADD COLUMN client_request_id...")
+                    conn.execute("ALTER TABLE tasks ADD COLUMN client_request_id TEXT")
+                    logger.info("Added client_request_id column to tasks table")
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"client_request_id column already exists or error adding it: {e}")
             
             logger.debug("Executing CREATE TABLE IF NOT EXISTS executions...")
             conn.execute("""
@@ -99,6 +116,9 @@ class Database:
     
     def save_task(self, task: Task) -> None:
         """Save a task to the database."""
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             # Check if reminder columns exist
             try:
@@ -107,8 +127,8 @@ class Database:
                     INSERT OR REPLACE INTO tasks
                     (id, name, schedule, type, command, api_url, api_method, api_headers, 
                      api_body, prompt, description, enabled, do_only_once, last_run, next_run, 
-                     status, created_at, updated_at, reminder_title, reminder_message)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     status, created_at, updated_at, reminder_title, reminder_message, client_request_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.id,
@@ -130,7 +150,8 @@ class Database:
                         task.created_at.isoformat(),
                         task.updated_at.isoformat(),
                         task.reminder_title,
-                        task.reminder_message
+                        task.reminder_message,
+                        task.client_request_id
                     )
                 )
             except sqlite3.OperationalError:
@@ -172,6 +193,9 @@ class Database:
     
     def get_task(self, task_id: str) -> Optional[Task]:
         """Get a task by ID."""
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -184,6 +208,9 @@ class Database:
     
     def get_all_tasks(self) -> List[Task]:
         """Get all tasks."""
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM tasks")
@@ -193,6 +220,9 @@ class Database:
     
     def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID."""
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             conn.commit()
@@ -201,23 +231,43 @@ class Database:
     
     def save_execution(self, execution: TaskExecution) -> None:
         """Save a task execution to the database."""
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO executions
-                (id, task_id, start_time, end_time, status, output, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    execution.id,
-                    execution.task_id,
-                    execution.start_time.isoformat(),
-                    execution.end_time.isoformat() if execution.end_time else None,
-                    execution.status.value,
-                    execution.output,
-                    execution.error
+            if execution.id is None:
+                conn.execute(
+                    """
+                    INSERT INTO executions
+                    (task_id, start_time, end_time, status, output, error)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        execution.task_id,
+                        execution.start_time.isoformat(),
+                        execution.end_time.isoformat() if execution.end_time else None,
+                        execution.status.value,
+                        execution.output,
+                        execution.error
+                    )
                 )
-            )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO executions
+                    (id, task_id, start_time, end_time, status, output, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        execution.id,
+                        execution.task_id,
+                        execution.start_time.isoformat(),
+                        execution.end_time.isoformat() if execution.end_time else None,
+                        execution.status.value,
+                        execution.output,
+                        execution.error
+                    )
+                )
             conn.commit()
     
     def get_executions(self, task_id: str, limit: int = 10) -> List[TaskExecution]:
@@ -236,7 +286,7 @@ class Database:
         """Convert a database row to a Task object."""
         # Check for reminder fields in the row
         has_reminder_fields = "reminder_title" in row.keys() and "reminder_message" in row.keys()
-        
+        has_client_request_id = "client_request_id" in row.keys()
         task = Task(
             id=row["id"],
             name=row["name"],
@@ -255,14 +305,11 @@ class Database:
             next_run=datetime.fromisoformat(row["next_run"]) if row["next_run"] else None,
             status=TaskStatus(row["status"]),
             created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"])
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            reminder_title=row["reminder_title"] if has_reminder_fields else None,
+            reminder_message=row["reminder_message"] if has_reminder_fields else None,
+            client_request_id=row["client_request_id"] if has_client_request_id else None
         )
-        
-        # Add reminder fields if available
-        if has_reminder_fields:
-            task.reminder_title = row["reminder_title"]
-            task.reminder_message = row["reminder_message"]
-            
         return task
     
     def _row_to_execution(self, row: sqlite3.Row) -> TaskExecution:

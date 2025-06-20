@@ -108,82 +108,66 @@ def human_readable_cron(cron_expression: str) -> str:
 
 def parse_relative_time_to_cron(relative_time: str) -> str:
     """
-    Parse a relative time expression and convert it to a cron expression.
-    
-    Examples:
-        "in 15 seconds" -> cron for 15 seconds from now
-        "in 1 minute" -> cron for 1 minute from now
-        "in 2 hours" -> cron for 2 hours from now
-        "in 1 day" -> cron for 1 day from now
-        "15 seconds" -> cron for 15 seconds from now
-        "1 minute" -> cron for 1 minute from now
-        "2023-10-06T17:09:05.000Z" -> cron for specific datetime
+    Parse a relative time expression and convert it to a cron expression or delay string.
+    - If < 60s: returns 'delay:N' (N=seconds)
+    - If >= 60s: returns cron (5 fields, no seconds)
+    - If ISO timestamp: returns cron (5 fields)
     """
     import logging
     logger = logging.getLogger(__name__)
     logger.info(f"=== PARSING RELATIVE TIME: '{relative_time}' ===")
+
+    from datetime import datetime, timedelta, UTC
+    import re
     
-    # First, try to parse as ISO timestamp
+    # Try ISO timestamp
     try:
-        from datetime import datetime
-        import re
-        
-        # Check if it's an ISO timestamp
         iso_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?$'
         if re.match(iso_pattern, relative_time):
             logger.info(f"Detected ISO timestamp: {relative_time}")
-            # Parse the ISO timestamp
             if relative_time.endswith('Z'):
                 target_time = datetime.fromisoformat(relative_time[:-1])
             else:
                 target_time = datetime.fromisoformat(relative_time)
-            
-            # For specific timestamps, we need to use a different approach
-            # since cron expressions don't handle specific dates well
-            # We'll use a relative approach based on current time
-            now = datetime.now()
+            now = datetime.now(UTC)
             time_diff = target_time - now
-            
-            if time_diff.total_seconds() <= 0:
-                # If the time has already passed, schedule for 1 minute from now
-                target_time = now + timedelta(minutes=1)
-            
-            # Generate cron expression including day and month for precision
+            if time_diff.total_seconds() < 60:
+                delay = max(1, int(time_diff.total_seconds()))
+                logger.info(f"ISO time < 60s, using delay:{delay}")
+                return f"delay:{delay}"
+            # 5-field cron: min hour day month dow
             cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
-            logger.info(f"Generated cron expression (from ISO, specific day/month): '{cron_expr}'")
+            logger.info(f"Generated cron (from ISO): '{cron_expr}'")
             return cron_expr
     except Exception as e:
         logger.info(f"Not an ISO timestamp: {e}")
-    
-    # Remove "in " prefix if present
+
+    # Relative time: 'in 20 seconds', '2 minutes', etc
     time_str = relative_time.lower().strip()
     if time_str.startswith("in "):
         time_str = time_str[3:]
-    
     logger.info(f"After removing 'in ' prefix: '{time_str}'")
-    
-    # Parse patterns like "15 seconds", "1 minute", "2 hours", "1 day"
     patterns = [
         (r"(\d+)\s*second", "seconds"),
         (r"(\d+)\s*minute", "minutes"), 
         (r"(\d+)\s*hour", "hours"),
         (r"(\d+)\s*day", "days"),
-        # Spanish patterns
         (r"(\d+)\s*segundo", "seconds"),
         (r"(\d+)\s*minuto", "minutes"),
         (r"(\d+)\s*hora", "hours"),
         (r"(\d+)\s*día", "days"),
-        (r"(\d+)\s*dia", "days")  # Without accent
+        (r"(\d+)\s*dia", "days")
     ]
-    
     for pattern, unit in patterns:
         match = re.match(pattern, time_str)
         if match:
             amount = int(match.group(1))
             logger.info(f"Matched pattern '{pattern}' with amount={amount}, unit={unit}")
-            now = datetime.now()
-
+            now = datetime.now(UTC)
             if unit == "seconds":
+                if amount < 60:
+                    logger.info(f"Delay < 60s, using delay:{amount}")
+                    return f"delay:{amount}"
                 target_time = now + timedelta(seconds=amount)
             elif unit == "minutes":
                 target_time = now + timedelta(minutes=amount)
@@ -193,19 +177,9 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
                 target_time = now + timedelta(days=amount)
             else:
                 raise ValueError(f"Unsupported time unit: {unit}")
-
-            # Si el target_time es hoy o mañana temprano, incluir día y mes para precisión
-            now_recheck = datetime.now(UTC) # Recheck now for most accurate comparison
-            if target_time.date() == now_recheck.date() or (target_time.date() == (now_recheck + timedelta(days=1)).date() and target_time.hour < now_recheck.hour + 2):
-                cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
-                logger.info(f"Generated cron expression (specific day/month): '{cron_expr}'")
-            else:
-                # Para duraciones más largas, mantener el cron más general
-                cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-                logger.info(f"Generated cron expression (general): '{cron_expr}'")
-
+            # 5-field cron: min hour day month dow
+            cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
+            logger.info(f"Generated cron (relative): '{cron_expr}'")
             return cron_expr
-    
-    # If no pattern matches, assume it's already a cron expression
     logger.info(f"No pattern matched, returning original: '{relative_time}'")
     return relative_time

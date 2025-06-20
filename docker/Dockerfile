@@ -32,4 +32,4 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 USER mcp
 
 # Set entrypoint
-ENTRYPOINT ["python", "main.py"] 
+ENTRYPOINT ["python", "main.py"]

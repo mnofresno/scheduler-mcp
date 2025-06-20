@@ -59,6 +59,7 @@ class Task(BaseModel):
     # Reminder-specific fields
     reminder_title: Optional[str] = None
     reminder_message: Optional[str] = None
+    client_request_id: Optional[str] = None  # <-- Agregado para asociar la tarea a la sesión SSE
 
     @field_validator("name", "command", "prompt", "description", "reminder_title", "reminder_message", mode="before")
     def validate_ascii_fields(cls, v):
@@ -117,13 +118,14 @@ class Task(BaseModel):
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "reminder_title": self.reminder_title,
-            "reminder_message": self.reminder_message
+            "reminder_message": self.reminder_message,
+            "client_request_id": self.client_request_id
         }
 
 
 class TaskExecution(BaseModel):
     """Model representing a task execution."""
-    id: str = Field(default_factory=lambda: f"exec_{uuid.uuid4().hex[:12]}")
+    id: Optional[int] = None
     task_id: str
     start_time: datetime = Field(default_factory=lambda: datetime.now(UTC))
     end_time: Optional[datetime] = None
