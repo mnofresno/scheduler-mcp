@@ -152,12 +152,11 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
         (r"(\d+)\s*minute", "minutes"), 
         (r"(\d+)\s*hour", "hours"),
         (r"(\d+)\s*day", "days"),
-        # The following patterns are for Spanish input compatibility. Remove or uncomment if multi-language support is needed.
-        # (r"(\d+)\s*segundo", "seconds"),
-        # (r"(\d+)\s*minuto", "minutes"),
-        # (r"(\d+)\s*hora", "hours"),
-        # (r"(\d+)\s*día", "days"),
-        # (r"(\d+)\s*dia", "days")
+        (r"(\d+)\s*segundo", "seconds"),
+        (r"(\d+)\s*minuto", "minutes"),
+        (r"(\d+)\s*hora", "hours"),
+        (r"(\d+)\s*día", "days"),
+        (r"(\d+)\s*dia", "days")
     ]
     for pattern, unit in patterns:
         match = re.match(pattern, time_str)
@@ -184,38 +183,3 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
             return cron_expr
     logger.info(f"No pattern matched, returning original: '{relative_time}'")
     return relative_time
-
-
-def parse_structured_schedule(schedule):
-    """
-    Convert a structured schedule (dict) to a string schedule (delay:N or cron).
-    Supports:
-      - relative: {"schedule_type": "relative", "unit": "seconds"|"minutes"|"hours", "amount": N}
-      - absolute: {"schedule_type": "absolute", "datetime": ISO8601}
-      - recurrent: {"schedule_type": "recurrent", "cron": "..."}
-    """
-    if isinstance(schedule, dict):
-        stype = schedule.get("schedule_type")
-        if stype == "relative":
-            unit = schedule.get("unit")
-            amount = int(schedule.get("amount", 0))
-            factor = {"seconds": 1, "minutes": 60, "hours": 3600}.get(unit, 1)
-            delay_seconds = amount * factor
-            return f"delay:{delay_seconds}"
-        elif stype == "absolute":
-            dt = schedule.get("datetime")
-            from datetime import datetime, timezone
-            target = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            delay_seconds = int((target - now).total_seconds())
-            if delay_seconds < 0:
-                raise ValueError("Datetime is in the past")
-            return f"delay:{delay_seconds}"
-        elif stype == "recurrent":
-            return schedule.get("cron")
-        else:
-            raise ValueError(f"Unknown schedule_type: {stype}")
-    elif isinstance(schedule, str):
-        return schedule
-    else:
-        raise ValueError("Invalid schedule format")

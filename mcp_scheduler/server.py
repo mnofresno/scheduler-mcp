@@ -938,6 +938,25 @@ class McpScheduler:
         else:
             return str(obj)
 
+    def _make_json_serializable(self, obj):
+        # Convierte objetos Task, Execution, datetime, etc. a tipos serializables
+        import datetime
+        from .task import Task, TaskExecution
+        if isinstance(obj, dict):
+            return {k: self._make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_json_serializable(v) for v in obj]
+        elif hasattr(obj, 'dict') and callable(getattr(obj, 'dict', None)):
+            return self._make_json_serializable(obj.dict())
+        elif hasattr(obj, '__dict__'):
+            return self._make_json_serializable(vars(obj))
+        elif isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        else:
+            return str(obj)
+
     def send_sse_message(self, session_id: str, message: Dict[str, Any]):
         session = self.sessions.get(session_id)
         if session and session["status"] == "connected":
