@@ -366,9 +366,15 @@ class McpScheduler:
                 "tools": [
                     {
                         "name": "schedule_task",
-                        "description": "Schedule a task to be executed at a specific time. The 'schedule' field must be a structured JSON object. See the 'schedule' property for details and examples.",
+                        "description": (
+                            "Schedule a task to be executed at a specific time. "
+                            "If type is 'reminder', the reminder_message will be sent to the user at the scheduled time. "
+                            "If type is 'ai', the prompt will be sent to the LLM as a new simulated user message at the scheduled time (see 'execute_ai_task' event). "
+                            "This allows you to schedule future LLM actions, not solo reminders."
+                        ),
                         "endpoint": "messages",
                         "method": "POST",
+                        "sync": False,  # This tool is async: result is delivered via SSE/event
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -413,14 +419,17 @@ class McpScheduler:
                                         }
                                     ]
                                 },
-                                "type": {"type": "string", "enum": ["shell_command", "api_call", "ai", "reminder"], "description": "Type of task to schedule."},
+                                "type": {"type": "string", "enum": ["shell_command", "api_call", "ai", "reminder"], "description": (
+                                    "Type of task to schedule. Use 'reminder' to send a message at the scheduled time. "
+                                    "Use 'ai' to schedule a future LLM action (the prompt will be sent to the LLM as a new user message when triggered)."
+                                )},
                                 "command": {"type": "string", "description": "Shell command to execute (for shell_command tasks)."},
                                 "api_url": {"type": "string", "description": "API URL to call (for api_call tasks)."},
                                 "api_method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "description": "HTTP method for API call."},
                                 "api_headers": {"type": "object", "description": "Headers for API call."},
                                 "api_body": {"type": "object", "description": "Body for API call."},
-                                "prompt": {"type": "string", "description": "Prompt for AI tasks."},
-                                "reminder_message": {"type": "string", "description": "Message to show for reminder tasks."},
+                                "prompt": {"type": "string", "description": "Prompt for AI tasks. This will be sent to the LLM as a simulated user message when the task is triggered (type='ai')."},
+                                "reminder_message": {"type": "string", "description": "Message to show for reminder tasks (type='reminder')."},
                                 "reminder_title": {"type": "string", "description": "Title for reminder tasks."},
                                 "do_only_once": {"type": "boolean", "description": "If true, the task will only run once."},
                                 "enabled": {"type": "boolean", "description": "If false, the task will not be scheduled until enabled."}
@@ -450,9 +459,10 @@ class McpScheduler:
                     },
                     {
                         "name": "list_tasks",
-                        "description": "List all scheduled tasks",
+                        "description": "List all scheduled tasks. This tool is synchronous: the result must be rendered immediately as human-readable output, regardless of whether the transport is HTTP or SSE.",
                         "endpoint": "messages",
                         "method": "POST",
+                        "sync": True,  # This tool is sync: result is returned immediately
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -488,7 +498,30 @@ class McpScheduler:
                             },
                             "required": ["task_id", "prompt", "result"]
                         }
-                    }
+                    },
+                    {
+                        "name": "delete_task",
+                        "description": "Delete a scheduled task by its unique id. To delete a task by name, you MUST first call list_tasks, find the id by matching the name, and then call delete_task(id).",
+                        "endpoint": "messages",
+                        "method": "POST",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": {"type": "string", "description": "The id of the task to delete. Use list_tasks to find the id if you only know the name."}
+                            },
+                            "required": ["task_id"]
+                        }
+                    },
+                    {
+                        "name": "delete_all_tasks",
+                        "description": "Delete all scheduled tasks for the current user (client_request_id). Use this to clear all your scheduled tasks.",
+                        "endpoint": "messages",
+                        "method": "POST",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
                 ]
             }
 
@@ -583,17 +616,8 @@ class McpScheduler:
         async def process_message(request: Request, background_tasks: BackgroundTasks):
             logger.info("=== ENDPOINT CALLED: /mcp/messages ===")
             try:
-                logger.info("Received POST request to /mcp/messages")
-                raw_body = await request.body()
-                logger.info(f"Raw request body: {raw_body}")
-                try:
-                    data = await request.json()
-                except Exception as e:
-                    logger.error(f"Error parsing JSON: {e}")
-                    raise HTTPException(status_code=400, detail="Invalid JSON")
-                logger.info(f"Parsed request data: {data}")
-                
-                # Manejar formato JSON-RPC
+                data = await request.json()
+                logger.info(f"Request data: {data}")
                 if "jsonrpc" in data:
                     session_id = data.get("id")
                     tool = data.get("method")
@@ -604,24 +628,52 @@ class McpScheduler:
                     tool = data.get("tool")
                     args = data.get("args", {})
                     client_request_id = data.get("client_request_id")
-
                 logger.info(f"Extracted: session_id={session_id}, tool={tool}, args={args}")
-
                 if not session_id:
                     logger.error("Session ID is required but not provided")
                     raise HTTPException(status_code=400, detail="Session ID is required")
-
                 if session_id not in self.sessions:
                     logger.error(f"Session {session_id} not found. Available sessions: {list(self.sessions.keys())}")
                     raise HTTPException(status_code=404, detail="Session not found")
-
                 session = self.sessions[session_id]
                 logger.info("Session found: {}, status: {}".format(session_id, session["status"]))
-                
                 if session["status"] != "connected":
                     logger.error(f"Session {session_id} is not active, status: {session['status']}")
                     raise HTTPException(status_code=400, detail="Session is not active")
-
+                # --- SYNC TOOL HANDLING ---
+                if tool == "list_tasks":
+                    try:
+                        status_filter = args.get("status", "all")
+                        type_filter = args.get("type", "all")
+                        tasks = await self.scheduler.get_all_tasks()
+                        filtered_tasks = [
+                            task.to_dict()
+                            for task in tasks
+                            if (status_filter == "all" or task.status.value == status_filter) and
+                               (type_filter == "all" or task.type.value == type_filter)
+                        ]
+                        result_message = {
+                            "type": "result",
+                            "result": {
+                                "tasks": filtered_tasks
+                            },
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "client_request_id": client_request_id
+                        }
+                        logger.info(f"[SYNC] Returning result for list_tasks: {result_message}")
+                        return JSONResponse(result_message)
+                    except Exception as e:
+                        error_message = {
+                            "type": "result",
+                            "result": {
+                                "error": f"Error listing tasks: {str(e)}"
+                            },
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "client_request_id": client_request_id
+                        }
+                        logger.error(f"[SYNC] Error in list_tasks: {error_message}")
+                        return JSONResponse(error_message, status_code=500)
+                # --- END SYNC TOOL HANDLING ---
                 logger.info(f"Adding background task: process_tool_request({session_id}, {tool}, {args})")
                 background_tasks.add_task(self.process_tool_request, session_id, tool, args, client_request_id)
                 logger.info("Background task added successfully")
@@ -731,25 +783,31 @@ class McpScheduler:
                     status_filter = args.get("status", "all")
                     type_filter = args.get("type", "all")
                     tasks = await self.scheduler.get_all_tasks()
-                    
                     filtered_tasks = [
                         task.to_dict()
                         for task in tasks
                         if (status_filter == "all" or task.status.value == status_filter) and
                            (type_filter == "all" or task.type.value == type_filter)
                     ]
-
-                    session_info["messages"].append({
-                        "type": "task_list",
-                        "tasks": filtered_tasks,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
+                    result_message = {
+                        "type": "result",
+                        "result": {
+                            "tasks": filtered_tasks
+                        },
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "client_request_id": client_request_id
+                    }
+                    self.send_sse_message(session_id, result_message)
                 except Exception as e:
-                    session_info["messages"].append({
-                        "type": "error",
-                        "error": f"Error listing tasks: {str(e)}",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    })
+                    error_message = {
+                        "type": "result",
+                        "result": {
+                            "error": f"Error listing tasks: {str(e)}"
+                        },
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "client_request_id": client_request_id
+                    }
+                    self.send_sse_message(session_id, error_message)
 
             elif tool == "run_task":
                 try:
@@ -844,6 +902,62 @@ class McpScheduler:
                         "timestamp": datetime.now(UTC).isoformat()
                     })
 
+            elif tool == "delete_task":
+                try:
+                    task_id = args.get("task_id")
+                    if not task_id:
+                        raise ValueError("task_id is required")
+                    deleted = await self.scheduler.delete_task(task_id)
+                    if deleted:
+                        result_message = {
+                            "type": "result",
+                            "result": {"message": f"Tarea {task_id} eliminada correctamente."},
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "client_request_id": client_request_id
+                        }
+                    else:
+                        result_message = {
+                            "type": "result",
+                            "result": {"error": f"No se pudo eliminar la tarea {task_id}."},
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "client_request_id": client_request_id
+                        }
+                    self.send_sse_message(session_id, result_message)
+                except Exception as e:
+                    error_message = {
+                        "type": "result",
+                        "result": {"error": f"Error eliminando tarea: {str(e)}"},
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "client_request_id": client_request_id
+                    }
+                    self.send_sse_message(session_id, error_message)
+
+            elif tool == "delete_all_tasks":
+                try:
+                    # Eliminar todas las tareas asociadas al client_request_id
+                    all_tasks = await self.scheduler.get_all_tasks()
+                    user_tasks = [t for t in all_tasks if getattr(t, "client_request_id", None) == client_request_id]
+                    deleted_count = 0
+                    for t in user_tasks:
+                        deleted = await self.scheduler.delete_task(t.id)
+                        if deleted:
+                            deleted_count += 1
+                    result_message = {
+                        "type": "result",
+                        "result": {"message": f"Se eliminaron {deleted_count} tareas programadas para este usuario."},
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "client_request_id": client_request_id
+                    }
+                    self.send_sse_message(session_id, result_message)
+                except Exception as e:
+                    error_message = {
+                        "type": "result",
+                        "result": {"error": f"Error eliminando todas las tareas: {str(e)}"},
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "client_request_id": client_request_id
+                    }
+                    self.send_sse_message(session_id, error_message)
+
             else:
                 session_info["messages"].append({
                     "type": "error",
@@ -898,6 +1012,24 @@ class McpScheduler:
                         self.send_sse_message(sid, reminder_message)
                 else:
                     logger.warning(f"[on_task_executed] No active session found for client_request_id {task.client_request_id} nor any persistent session. Not sending reminder via SSE.")
+        # NUEVO: Emitir evento execute_ai_task si corresponde
+        if task.type == TaskType.AI and execution.status == TaskStatus.COMPLETED:
+            ai_task_event = {
+                "type": "execute_ai_task",
+                "task_id": task.id,
+                "prompt": task.prompt,
+                "executed_at": execution.end_time.isoformat() if execution.end_time else None,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "client_request_id": task.client_request_id
+            }
+            # Enviar a las sesiones asociadas al client_request_id
+            session_ids = self.client_to_sessions.get(task.client_request_id, set())
+            session_ids = set([sid for sid in session_ids if self.sessions.get(sid, {}).get("status") == "connected"])
+            if session_ids:
+                for sid in session_ids:
+                    self.send_sse_message(sid, ai_task_event)
+            else:
+                logger.warning(f"[on_task_executed] No active session found for client_request_id {task.client_request_id}. Not sending execute_ai_task via SSE.")
         # TODO: This should ideally only be sent if the original request expects a final result.
         # Currently, it's broadcasting, which might not be desired.
         result_message = {
