@@ -7,7 +7,7 @@ import shlex
 import subprocess
 import platform
 import os
-from datetime import datetime
+from datetime import datetime, UTC
 import aiohttp
 from typing import Optional, Tuple
 
@@ -91,7 +91,7 @@ class Executor:
             execution.status = TaskStatus.FAILED
             execution.error = str(e)
         
-        execution.end_time = datetime.utcnow()
+        execution.end_time = datetime.now(UTC)
         return execution
     
     async def _execute_shell_command(self, command: str) -> Tuple[Optional[str], Optional[str]]:
