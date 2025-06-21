@@ -584,8 +584,14 @@ class McpScheduler:
             logger.info("=== ENDPOINT CALLED: /mcp/messages ===")
             try:
                 logger.info("Received POST request to /mcp/messages")
-                data = await request.json()
-                logger.info(f"Request data: {data}")
+                raw_body = await request.body()
+                logger.info(f"Raw request body: {raw_body}")
+                try:
+                    data = await request.json()
+                except Exception as e:
+                    logger.error(f"Error parsing JSON: {e}")
+                    raise HTTPException(status_code=400, detail="Invalid JSON")
+                logger.info(f"Parsed request data: {data}")
                 
                 # Manejar formato JSON-RPC
                 if "jsonrpc" in data:
