@@ -59,7 +59,7 @@ class Task(BaseModel):
     # Reminder-specific fields
     reminder_title: Optional[str] = None
     reminder_message: Optional[str] = None
-    client_request_id: Optional[str] = None  # <-- Agregado para asociar la tarea a la sesión SSE
+    client_request_id: Optional[str] = None  # Added to associate the task with the SSE session
 
     @field_validator("name", "command", "prompt", "description", "reminder_title", "reminder_message", mode="before")
     def validate_ascii_fields(cls, v):
