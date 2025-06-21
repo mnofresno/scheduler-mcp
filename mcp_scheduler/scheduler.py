@@ -93,7 +93,7 @@ class Scheduler:
                     logger.debug(f"[Scheduler] Skipping running task {task.id} ({task.name})")
                     continue
 
-                # --- NEW LOGIC: structured schedule ---
+                # --- NUEVA LÓGICA: schedule estructurado ---
                 try:
                     schedule_str = parse_structured_schedule(task.schedule)
                 except Exception as e:
@@ -115,9 +115,9 @@ class Scheduler:
                     else:
                         logger.debug(f"[Scheduler] Task {task.id} not ready yet - next_run: {task.next_run}")
                     continue
-                # --- END NEW LOGIC ---
+                # --- FIN NUEVA LÓGICA ---
 
-                # Logic for cron
+                # Lógica para cron
                 if task.next_run is None:
                     try:
                         cron = croniter.croniter(schedule_str, now)

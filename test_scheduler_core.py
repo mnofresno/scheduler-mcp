@@ -81,17 +81,17 @@ async def test_scheduler_relative_time_delay_seconds(temp_db):
     executor = Executor(None, config.ai_model)
     scheduler = Scheduler(db, executor)
     await scheduler.start()
-    # Use structured format
+    # Usar formato estructurado
     schedule_struct = {"schedule_type": "relative", "unit": "seconds", "amount": 34}
     task = Task(name="TestDelay34s", schedule=schedule_struct, type=TaskType.REMINDER, reminder_message="Test message")
     t = await scheduler.add_task(task)
-    # Should save the structured dict
+    # Debe guardar el dict estructurado
     assert t.schedule == schedule_struct
-    # The parser should return delay:34
+    # El parser debe devolver delay:34
     from mcp_scheduler.utils import parse_structured_schedule
     assert parse_structured_schedule(t.schedule) == "delay:34"
-    # next_run should be ~34 seconds in the future
+    # next_run debe ser ~34 segundos en el futuro
     now = datetime.datetime.now(datetime.timezone.utc)
     delta = (t.next_run - now).total_seconds()
-    assert 30 <= delta <= 36  # 4s error margin
+    assert 30 <= delta <= 36  # margen de error de 4s
     await scheduler.stop()
