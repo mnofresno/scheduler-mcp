@@ -1065,6 +1065,8 @@ class McpScheduler:
 
     def _make_json_serializable(self, obj):
         # Convert Task, Execution, datetime, etc. objects to serializable types
+        import datetime
+        from .task import Task, TaskExecution
         if isinstance(obj, dict):
             return {k: self._make_json_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, list):
@@ -1122,3 +1124,7 @@ class McpScheduler:
             del self.sessions[session_id]
         else:
             logger.info(f"Session {session_id} already cleaned up or does not exist.")
+
+if __name__ == "__main__":
+    scheduler = McpScheduler()
+    scheduler.run()
