@@ -577,11 +577,11 @@ class McpScheduler:
                 try:
                     while True:
                         try:
-                            # Check if the session is still active
+                            # Verificar si la sesión sigue activa
                             if session_id not in self.sessions:
                                 logger.info(f"[SSE-TRACE] Session {session_id} no longer exists. Exiting event_generator loop.")
                                 break
-                            # Send heartbeats every self.config.heartbeat_interval seconds
+                            # Enviar heartbeats cada self.config.heartbeat_interval segundos
                             now = datetime.now(UTC)
                             if (now - last_heartbeat_sent).total_seconds() > self.config.heartbeat_interval:
                                 heartbeat_message = {"type": "heartbeat", "timestamp": now.isoformat()}
@@ -589,20 +589,19 @@ class McpScheduler:
                                 yield f"data: {json.dumps(heartbeat_message)}\n\n"
                                 last_heartbeat_sent = now
 
-                            # Reset the session inactivity counter
-                            self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
-
                             # Intentar obtener un mensaje de la cola con un timeout
                             msg = await asyncio.wait_for(self.sessions[session_id]["queue"].get(), timeout=1.0) # Wait 1 second
                             logger.info(f"[SSE-TRACE] Yielding message to client for session {session_id}: {msg}")
-                            # No messages, continue the loop for the heartbeat
-                            pass
+                            # Resetear el contador de inactividad de la sesión
+                            self.sessions[session_id]["last_heartbeat"] = datetime.now(UTC)
+                            logger.debug(f"Sending message to session {session_id}: {msg}")
+                            yield f"data: {json.dumps(msg)}\n\n"
                         except asyncio.TimeoutError:
-                            # No messages, continue the loop for the heartbeat
+                            # No hay mensajes, continuar con el bucle para el heartbeat
                             pass
                         except Exception as e:
                             logger.error(f"Error in event_generator for session {session_id}: {e}")
-                            # If the session no longer exists, exit the event_generator loop
+                            # Si la sesión ya no existe, salir del bucle
                             if session_id not in self.sessions:
                                 logger.info(f"Session {session_id} was removed after error. Exiting event_generator loop.")
                                 break
@@ -1065,9 +1064,7 @@ class McpScheduler:
             logger.warning(f"[on_task_executed] No active session found for client_request_id {task.client_request_id}. Not sending result via SSE.")
 
     def _make_json_serializable(self, obj):
-        # Converts Task, Execution, datetime, etc. objects to serializable types
-        import datetime
-        from .task import Task, TaskExecution
+        # Convert Task, Execution, datetime, etc. objects to serializable types
         if isinstance(obj, dict):
             return {k: self._make_json_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, list):
