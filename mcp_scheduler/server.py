@@ -1064,7 +1064,9 @@ class McpScheduler:
             logger.warning(f"[on_task_executed] No active session found for client_request_id {task.client_request_id}. Not sending result via SSE.")
 
     def _make_json_serializable(self, obj):
-        # Convert Task, Execution, datetime, etc. objects to serializable types
+        # Convierte objetos Task, Execution, datetime, etc. a tipos serializables
+        import datetime
+        from .task import Task, TaskExecution
         if isinstance(obj, dict):
             return {k: self._make_json_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, list):
