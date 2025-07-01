@@ -46,8 +46,6 @@ def handle_sigterm(signum, frame):
     shutdown_event.set()
     if scheduler:
         scheduler.stop()
-    if server:
-        server.stop()
     if scheduler_thread and scheduler_thread.is_alive():
         scheduler_thread.join(timeout=5)
     if scheduler_loop and scheduler_loop.is_running():

@@ -152,11 +152,12 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
         (r"(\d+)\s*minute", "minutes"), 
         (r"(\d+)\s*hour", "hours"),
         (r"(\d+)\s*day", "days"),
-        (r"(\d+)\s*segundo", "seconds"),
-        (r"(\d+)\s*minuto", "minutes"),
-        (r"(\d+)\s*hora", "hours"),
-        (r"(\d+)\s*día", "days"),
-        (r"(\d+)\s*dia", "days")
+        # The following patterns are for Spanish input compatibility. Remove if only English is required.
+        # (r"(\d+)\s*segundo", "seconds"),
+        # (r"(\d+)\s*minuto", "minutes"),
+        # (r"(\d+)\s*hora", "hours"),
+        # (r"(\d+)\s*día", "days"),
+        # (r"(\d+)\s*dia", "days")
     ]
     for pattern, unit in patterns:
         match = re.match(pattern, time_str)
