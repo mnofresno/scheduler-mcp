@@ -152,7 +152,7 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
         (r"(\d+)\s*minute", "minutes"), 
         (r"(\d+)\s*hour", "hours"),
         (r"(\d+)\s*day", "days"),
-        # The following patterns are for Spanish input compatibility. Remove if only English is required.
+        # The following patterns are for Spanish input compatibility. Remove or uncomment if multi-language support is needed.
         # (r"(\d+)\s*segundo", "seconds"),
         # (r"(\d+)\s*minuto", "minutes"),
         # (r"(\d+)\s*hora", "hours"),

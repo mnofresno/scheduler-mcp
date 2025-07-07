@@ -31,7 +31,7 @@ class Config:
         self.check_interval = int(os.environ.get("MCP_SCHEDULER_CHECK_INTERVAL", "5"))
         self.execution_timeout = int(os.environ.get("MCP_SCHEDULER_EXECUTION_TIMEOUT", "300"))
         
-        # Base path para endpoints
+        # Base path for endpoints
         self.base_path = os.environ.get("MCP_SCHEDULER_BASE_PATH", "/mcp")
         
         # Heartbeat configuration
@@ -79,7 +79,7 @@ class Config:
             self.check_interval = config.get("scheduler", {}).get("check_interval", self.check_interval)
             self.execution_timeout = config.get("scheduler", {}).get("execution_timeout", self.execution_timeout)
             
-            # Base path para endpoints
+            # Base path for endpoints
             self.base_path = config.get("scheduler", {}).get("base_path", self.base_path)
             
             # Heartbeat configuration
