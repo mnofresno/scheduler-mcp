@@ -5,7 +5,7 @@ from mcp_scheduler.config import Config
 from mcp_scheduler.executor import Executor
 from mcp_scheduler.persistence import Database
 from mcp_scheduler.scheduler import Scheduler
-from mcp_scheduler.server import McpScheduler
+from mcp_scheduler.server import SchedulerServer
 
 def get_schema(client):
     resp = client.get("/.well-known/mcp-schema.json")
@@ -26,7 +26,7 @@ def test_mcp_schema_matches_functions():
     db = Database(":memory:")
     executor = Executor(None, config.ai_model)
     scheduler = Scheduler(db, executor)
-    server = McpScheduler(db, executor)
+    server = SchedulerServer(scheduler, config)
     client = TestClient(server.app)
     schema = get_schema(client)
     # --- Assertion: all tool names in schema are implemented as endpoints ---

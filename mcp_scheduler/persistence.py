@@ -24,8 +24,10 @@ class Database:
     def _create_tables(self):
         """Create the necessary tables if they don't exist."""
         logger.info(f"Attempting to create database tables at {self.db_path}")
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        # Ensure the directory exists, unless using in-memory DB
+        dir_path = os.path.dirname(self.db_path)
+        if self.db_path != ':memory:' and dir_path:
+            os.makedirs(dir_path, exist_ok=True)
 
         # Connect to the database. If it doesn't exist, it will be created.
         with sqlite3.connect(self.db_path) as conn:
