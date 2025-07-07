@@ -201,9 +201,20 @@ def main():
         database = Database(config.db_path)
         logger.info("Database initialized successfully.")
 
+<<<<<<< HEAD
         logger.info("Initializing Executor...")
         executor = Executor(config)
         logger.info("Executor initialized successfully.")
+=======
+        # If the transport is SSE, launch the well-known server in a separate thread
+        if config.transport == "sse":
+            log_to_stderr(f"Starting well-known server on port {config.server_port + 1}")
+            threading.Thread(target=start_well_known_server, daemon=True).start()
+
+        # Start the MCP server (this will block with stdio transport)
+        log_to_stderr(f"Starting MCP server with {config.transport} transport")
+        server.start()
+>>>>>>> 25633b5 (fix(i18n): translate all comments to English for consistency)
         
         logger.info("Initializing McpScheduler...")
         server = McpScheduler(database, executor) # This will initialize Database and Scheduler
