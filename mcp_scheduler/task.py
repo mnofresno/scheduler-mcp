@@ -40,7 +40,7 @@ class Task(BaseModel):
     """Model representing a scheduled task."""
     id: str = Field(default_factory=lambda: f"task_{uuid.uuid4().hex[:12]}")
     name: str
-    schedule: Dict[str, Any]  # Ahora schedule es siempre un JSON estructurado
+    schedule: str
     type: TaskType = TaskType.SHELL_COMMAND
     command: Optional[str] = None
     api_url: Optional[str] = None
@@ -59,7 +59,7 @@ class Task(BaseModel):
     # Reminder-specific fields
     reminder_title: Optional[str] = None
     reminder_message: Optional[str] = None
-    client_request_id: Optional[str] = None  # Added to associate the task with the SSE session
+    client_request_id: Optional[str] = None  # <-- Agregado para asociar la tarea a la sesión SSE
 
     @field_validator("name", "command", "prompt", "description", "reminder_title", "reminder_message", mode="before")
     def validate_ascii_fields(cls, v):
@@ -96,45 +96,6 @@ class Task(BaseModel):
             raise ValueError("Message is required for reminder tasks")
         return v
     
-    @classmethod
-    def from_db_row(cls, row):
-        import json
-        schedule = row["schedule"]
-        if isinstance(schedule, str):
-            try:
-                schedule = json.loads(schedule)
-            except Exception:
-                schedule = {"schedule_type": "legacy", "value": schedule}
-        return cls(
-            id=row["id"],
-            name=row["name"],
-            schedule=schedule,
-            type=TaskType(row["type"]),
-            command=row["command"] if "command" in row.keys() else None,
-            api_url=row["api_url"] if "api_url" in row.keys() else None,
-            api_method=row["api_method"] if "api_method" in row.keys() else None,
-            api_headers=row["api_headers"] if "api_headers" in row.keys() else None,
-            api_body=row["api_body"] if "api_body" in row.keys() else None,
-            prompt=row["prompt"] if "prompt" in row.keys() else None,
-            description=row["description"] if "description" in row.keys() else None,
-            enabled=row["enabled"] if "enabled" in row.keys() else True,
-            do_only_once=row["do_only_once"] if "do_only_once" in row.keys() else True,
-            last_run=row["last_run"] if "last_run" in row.keys() else None,
-            next_run=row["next_run"] if "next_run" in row.keys() else None,
-            status=TaskStatus(row["status"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            reminder_title=row["reminder_title"] if "reminder_title" in row.keys() else None,
-            reminder_message=row["reminder_message"] if "reminder_message" in row.keys() else None,
-            client_request_id=row["client_request_id"] if "client_request_id" in row.keys() else None
-        )
-
-    def to_db_dict(self):
-        import json
-        d = self.model_dump()
-        d["schedule"] = json.dumps(self.schedule)
-        return d
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert the task to a dictionary for serialization."""
         return {

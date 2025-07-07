@@ -120,8 +120,8 @@ class Database:
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
+            # Check if reminder columns exist
             try:
-                d = task.to_db_dict()
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO tasks
@@ -131,18 +131,31 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        d["id"], d["name"], d["schedule"], d["type"], d["command"], d["api_url"], d["api_method"],
-                        d["api_headers"], d["api_body"], d["prompt"], d["description"],
-                        1 if d["enabled"] else 0, 1 if d["do_only_once"] else 0,
-                        d["last_run"].isoformat() if d["last_run"] else None,
-                        d["next_run"].isoformat() if d["next_run"] else None,
-                        d["status"], d["created_at"].isoformat(), d["updated_at"].isoformat(),
-                        d["reminder_title"], d["reminder_message"], d["client_request_id"]
+                        task.id,
+                        task.name,
+                        task.schedule,
+                        task.type.value,
+                        task.command,
+                        task.api_url,
+                        task.api_method,
+                        json.dumps(task.api_headers) if task.api_headers else None,
+                        json.dumps(task.api_body) if task.api_body else None,
+                        task.prompt,
+                        task.description,
+                        1 if task.enabled else 0,
+                        1 if task.do_only_once else 0,
+                        task.last_run.isoformat() if task.last_run else None,
+                        task.next_run.isoformat() if task.next_run else None,
+                        task.status.value,
+                        task.created_at.isoformat(),
+                        task.updated_at.isoformat(),
+                        task.reminder_title,
+                        task.reminder_message,
+                        task.client_request_id
                     )
                 )
             except sqlite3.OperationalError:
                 # Fallback for databases without reminder columns
-                d = task.to_db_dict()
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO tasks
@@ -152,15 +165,30 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        d["id"], d["name"], d["schedule"], d["type"], d["command"], d["api_url"], d["api_method"],
-                        d["api_headers"], d["api_body"], d["prompt"], d["description"],
-                        1 if d["enabled"] else 0, 1 if d["do_only_once"] else 0,
-                        d["last_run"].isoformat() if d["last_run"] else None,
-                        d["next_run"].isoformat() if d["next_run"] else None,
-                        d["status"], d["created_at"].isoformat(), d["updated_at"].isoformat()
+                        task.id,
+                        task.name,
+                        task.schedule,
+                        task.type.value,
+                        task.command,
+                        task.api_url,
+                        task.api_method,
+                        json.dumps(task.api_headers) if task.api_headers else None,
+                        json.dumps(task.api_body) if task.api_body else None,
+                        task.prompt,
+                        task.description,
+                        1 if task.enabled else 0,
+                        1 if task.do_only_once else 0,
+                        task.last_run.isoformat() if task.last_run else None,
+                        task.next_run.isoformat() if task.next_run else None,
+                        task.status.value,
+                        task.created_at.isoformat(),
+                        task.updated_at.isoformat()
                     )
                 )
+                
+                # Log warning about missing reminder columns
                 logger.warning("Database missing reminder columns - task reminder data not saved")
+                
             conn.commit()
     
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -172,10 +200,12 @@ class Database:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
             row = cursor.fetchone()
-            if row:
-                return Task.from_db_row(row)
-            return None
-
+            
+            if not row:
+                return None
+                
+            return self._row_to_task(row)
+    
     def get_all_tasks(self) -> List[Task]:
         """Get all tasks."""
         db_dir = os.path.dirname(self.db_path)
@@ -184,7 +214,9 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM tasks")
-            return [Task.from_db_row(row) for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            
+            return [self._row_to_task(row) for row in rows]
     
     def delete_task(self, task_id: str) -> bool:
         """Delete a task by ID."""
