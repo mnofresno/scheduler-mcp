@@ -1,0 +1,1 @@
+# If the transport is SSE, launch the well-known server in a separate thread 

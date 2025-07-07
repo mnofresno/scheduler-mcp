@@ -1,0 +1,28 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.4.0, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /media/mariano/DevUnix/switch-bot-automation/scheduler-mcp
+plugins: anyio-4.9.0, asyncio-1.0.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 13 items
+
+test_config.py::test_config_env_vars PASSED                              [  7%]
+test_config.py::test_config_file_load PASSED                             [ 15%]
+test_executor.py::test_executor_init PASSED                              [ 23%]
+test_executor.py::test_executor_run_shell FAILED                         [ 30%]
+
+=================================== FAILURES ===================================
+___________________________ test_executor_run_shell ____________________________
+
+    @pytest.mark.asyncio
+    async def test_executor_run_shell():
+        e = Executor()
+>       result = await e.run_shell("echo hi")
+                       ^^^^^^^^^^^
+E       AttributeError: 'Executor' object has no attribute 'run_shell'
+
+test_executor.py:12: AttributeError
+=========================== short test summary info ============================
+FAILED test_executor.py::test_executor_run_shell - AttributeError: 'Executor'...
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+=================== 1 failed, 3 passed, 6 warnings in 0.79s ====================
