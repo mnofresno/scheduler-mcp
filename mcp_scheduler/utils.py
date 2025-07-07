@@ -4,7 +4,7 @@ Utility functions for MCP Scheduler.
 import logging
 import sys
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import re
 
 
@@ -145,14 +145,12 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
             time_diff = target_time - now
             
             if time_diff.total_seconds() <= 0:
-                # If the time has already passed, schedule for next occurrence
-                # For now, just schedule for 1 minute from now
+                # If the time has already passed, schedule for 1 minute from now
                 target_time = now + timedelta(minutes=1)
             
-            # Convert to cron expression: minute hour day month day_of_week (5 columns)
-            # Use * for day and month to make it relative to current date
-            cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-            logger.info(f"Generated cron expression from ISO: '{cron_expr}'")
+            # Generate cron expression including day and month for precision
+            cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
+            logger.info(f"Generated cron expression (from ISO, specific day/month): '{cron_expr}'")
             return cron_expr
     except Exception as e:
         logger.info(f"Not an ISO timestamp: {e}")
@@ -184,7 +182,7 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
             amount = int(match.group(1))
             logger.info(f"Matched pattern '{pattern}' with amount={amount}, unit={unit}")
             now = datetime.now()
-            
+
             if unit == "seconds":
                 target_time = now + timedelta(seconds=amount)
             elif unit == "minutes":
@@ -195,11 +193,17 @@ def parse_relative_time_to_cron(relative_time: str) -> str:
                 target_time = now + timedelta(days=amount)
             else:
                 raise ValueError(f"Unsupported time unit: {unit}")
-            
-            # Convert to cron expression: minute hour day month day_of_week (5 columns)
-            # Use * for day and month to make it relative to current date
-            cron_expr = f"{target_time.minute} {target_time.hour} * * *"
-            logger.info(f"Generated cron expression: '{cron_expr}'")
+
+            # Si el target_time es hoy o mañana temprano, incluir día y mes para precisión
+            now_recheck = datetime.now(UTC) # Recheck now for most accurate comparison
+            if target_time.date() == now_recheck.date() or (target_time.date() == (now_recheck + timedelta(days=1)).date() and target_time.hour < now_recheck.hour + 2):
+                cron_expr = f"{target_time.minute} {target_time.hour} {target_time.day} {target_time.month} *"
+                logger.info(f"Generated cron expression (specific day/month): '{cron_expr}'")
+            else:
+                # Para duraciones más largas, mantener el cron más general
+                cron_expr = f"{target_time.minute} {target_time.hour} * * *"
+                logger.info(f"Generated cron expression (general): '{cron_expr}'")
+
             return cron_expr
     
     # If no pattern matches, assume it's already a cron expression

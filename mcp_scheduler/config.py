@@ -31,19 +31,9 @@ class Config:
         self.check_interval = int(os.environ.get("MCP_SCHEDULER_CHECK_INTERVAL", "5"))
         self.execution_timeout = int(os.environ.get("MCP_SCHEDULER_EXECUTION_TIMEOUT", "300"))
         
-        # Base path for endpoints
-        self.base_path = os.environ.get("MCP_SCHEDULER_BASE_PATH", "/mcp")
-        
-        # Heartbeat configuration
-        self.heartbeat_interval = int(os.environ.get("MCP_SCHEDULER_HEARTBEAT_INTERVAL", "5"))
-        self.session_timeout = int(os.environ.get("MCP_SCHEDULER_SESSION_TIMEOUT", "300"))
-        
         # AI configuration
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", None)
         self.ai_model = os.environ.get("MCP_SCHEDULER_AI_MODEL", "gpt-4")  # Fixed model name
-        
-        # Reminder configuration
-        self.reminder_delay_seconds = int(os.environ.get("MCP_SCHEDULER_REMINDER_DELAY_SECONDS", "10"))
         
         # Load config from file if provided
         config_file = os.environ.get("MCP_SCHEDULER_CONFIG_FILE", None)
@@ -79,19 +69,9 @@ class Config:
             self.check_interval = config.get("scheduler", {}).get("check_interval", self.check_interval)
             self.execution_timeout = config.get("scheduler", {}).get("execution_timeout", self.execution_timeout)
             
-            # Base path for endpoints
-            self.base_path = config.get("scheduler", {}).get("base_path", self.base_path)
-            
-            # Heartbeat configuration
-            self.heartbeat_interval = config.get("scheduler", {}).get("heartbeat_interval", self.heartbeat_interval)
-            self.session_timeout = config.get("scheduler", {}).get("session_timeout", self.session_timeout)
-            
             # AI configuration
             self.openai_api_key = config.get("ai", {}).get("openai_api_key", self.openai_api_key)
             self.ai_model = config.get("ai", {}).get("model", self.ai_model)
-            
-            # Reminder configuration
-            self.reminder_delay_seconds = config.get("scheduler", {}).get("reminder_delay_seconds", self.reminder_delay_seconds)
             
         except Exception as e:
             print(f"Error loading config file: {e}")
@@ -116,11 +96,7 @@ class Config:
             },
             "scheduler": {
                 "check_interval": self.check_interval,
-                "execution_timeout": self.execution_timeout,
-                "base_path": self.base_path,
-                "heartbeat_interval": self.heartbeat_interval,
-                "session_timeout": self.session_timeout,
-                "reminder_delay_seconds": self.reminder_delay_seconds
+                "execution_timeout": self.execution_timeout
             },
             "ai": {
                 "model": self.ai_model,
