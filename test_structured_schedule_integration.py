@@ -16,9 +16,9 @@ async def test_structured_relative_schedule_seconds(tmp_path):
     schedule = {"schedule_type": "relative", "unit": "seconds", "amount": 12}
     task = Task(name="TestRelSec", schedule=schedule, type=TaskType.REMINDER, reminder_message="msg")
     t = await scheduler.add_task(task)
-    # Verifica que el schedule guardado es el dict estructurado
+    # Check that the saved schedule is the structured dict
     assert t.schedule == schedule
-    # Verifica que el parser da el delay correcto
+    # Check that the parser returns the correct delay
     assert parse_structured_schedule(t.schedule) == "delay:12"
     now = datetime.datetime.now(datetime.timezone.utc)
     delta = (t.next_run - now).total_seconds()
@@ -35,9 +35,9 @@ async def test_structured_absolute_schedule(tmp_path):
     schedule = {"schedule_type": "absolute", "datetime": future}
     task = Task(name="TestAbs", schedule=schedule, type=TaskType.REMINDER, reminder_message="msg")
     t = await scheduler.add_task(task)
-    # Schedule debe ser el dict estructurado
+    # Schedule should be the structured dict
     assert t.schedule == schedule
-    # El parser debe devolver delay:N
+    # The parser should return delay:N
     parsed = parse_structured_schedule(t.schedule)
     assert parsed.startswith("delay:")
     delay = int(parsed.split(":")[1])
