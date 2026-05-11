@@ -377,3 +377,50 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Uses [croniter](https://github.com/kiorky/croniter) for cron parsing
 - Uses [OpenAI API](https://openai.com/blog/openai-api) for AI tasks
 - Uses [FastMCP](https://github.com/jlowin/fastmcp) for enhanced MCP functionality
+
+## Docker Usage
+
+You can run MCP Scheduler in Docker using the provided `Dockerfile`.
+
+### Build the Docker image
+
+```bash
+docker build -t ghcr.io/phialsbasement/scheduler-mcp:latest .
+```
+
+### Run with Docker
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -p 8081:8081 \
+  -e MCP_SCHEDULER_TRANSPORT=sse \
+  -e MCP_SCHEDULER_PORT=8080 \
+  ghcr.io/phialsbasement/scheduler-mcp:latest
+
+# Nota:
+# El endpoint de auto-descubrimiento MCP se expone en el puerto 8081 (por defecto, si usas --port 8080).
+# Si quieres acceder a http://localhost:8081/.well-known/mcp-schema.json desde tu máquina,
+# debes mapear también el puerto 8081 del contenedor.
+# Puedes cambiar los puertos del host (por ejemplo, -p 1880:8080 -p 1881:8081) según tu preferencia.
+```
+
+### Docker Compose Example
+
+You can use the following service definition in your `docker-compose.yml`:
+
+```yaml
+services:
+  scheduler_mcp:
+    image: ghcr.io/phialsbasement/scheduler-mcp:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - MCP_SCHEDULER_TRANSPORT=sse
+      - MCP_SCHEDULER_PORT=8080
+```
+
+The container will start the server with the specified environment variables. You can override any configuration using environment variables as described above.
+
+---
